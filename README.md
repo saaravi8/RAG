@@ -1,5 +1,7 @@
 # Modular RAG skeleton
 
+[![CI](https://github.com/saaravi8/RAG/actions/workflows/ci.yml/badge.svg)](https://github.com/saaravi8/RAG/actions/workflows/ci.yml)
+
 A small, runnable retrieval-augmented generation foundation designed so each
 piece can be replaced independently. The core contains no model-provider,
 database, web-framework, or document-parser dependency.
@@ -241,3 +243,8 @@ No test-runner dependency is required:
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
+
+Every pull request and every push to `main` installs the package, runs the
+tests, and executes the end-to-end example on the oldest and newest supported
+Python versions. Dependabot checks the Python and GitHub Actions dependencies
+weekly and groups related updates into small pull requests.
