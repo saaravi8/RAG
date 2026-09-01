@@ -29,12 +29,12 @@ canonical Document
 
 QUERY SIDE
 
-question -> Retriever -> optional Reranker -> AnswerGenerator
-                 |                              |
-                 +-------- evidence ------------+
-                                                |
-                                                v
-                                  answer + citations       RAGService
+question + method -> Retriever strategy -> optional Reranker -> AnswerGenerator
+                           |                              |
+                           +-------- evidence ------------+
+                                                          |
+                                                          v
+                                            answer + citations       RAGService
 ```
 
 Every named component is a protocol in
@@ -80,6 +80,138 @@ Metadata filters are applied inside the vector store. Tenant or access-control
 filters should always be supplied by trusted application code, never copied
 directly from model output.
 
+## Use production embeddings
+
+For a local multilingual baseline, use
+[`intfloat/multilingual-e5-base`](https://huggingface.co/intfloat/multilingual-e5-base).
+It is MIT-licensed, emits 768-dimensional vectors, and balances retrieval
+quality against memory and inference cost. The adapter supplies E5's required
+`query: ` and `passage: ` prefixes and normalizes vectors for cosine search.
+
+Install the optional model runtime:
+
+```bash
+pip install -e ".[embeddings]"
+```
+
+Then inject the embedder into the existing composition root:
+
+```python
+from modular_rag import SentenceTransformerEmbedder, build_demo_rag
+
+embedder = SentenceTransformerEmbedder(
+    model_name="intfloat/multilingual-e5-base",
+    batch_size=32,
+    max_seq_length=512,
+)
+app = build_demo_rag(
+    embedder=embedder,
+    max_words=200,
+    overlap_words=30,
+)
+```
+
+The model's first construction downloads its weights. Pin or pre-download the
+model artifact in production (use `revision` with a Hub commit hash, or pass a
+local model path with `local_files_only=True`) so an upstream model update
+cannot silently change all new vectors. Changing the model, prefixes,
+normalization, or output dimensions requires re-embedding the entire index;
+query vectors and stored document vectors must always use the same
+configuration.
+
+Parameters worth tuning, in order:
+
+1. **Retrieval quality on your own data.** Build a small evaluation set of real
+   queries and relevant chunk IDs, then compare recall@k and nDCG@k. Public
+   leaderboards are a shortlist, not a final decision.
+2. **Language and domain.** Keep the multilingual default for mixed-language or
+   cross-language retrieval. An English-only model may be faster if the corpus
+   and every query are English. Legal, medical, or code corpora need their own
+   evaluation set.
+3. **Input length and chunking.** E5-base truncates inputs after 512 tokens.
+   Keep chunks below that limit, including the `passage: ` prefix. Smaller
+   `max_seq_length` values improve throughput when the relevant evidence is
+   short.
+4. **Vector dimensions and index size.** This model uses 768 floats: about 3 KB
+   per vector in float32 before index overhead. More dimensions usually cost
+   more RAM, storage, and search time; do not truncate a model unless it was
+   trained to support dimension truncation.
+5. **Batch size and device.** Increase `batch_size` until GPU or unified memory
+   is efficiently used without out-of-memory errors. CPU deployments normally
+   need smaller batches and should be benchmarked with realistic chunk lengths.
+6. **Similarity and normalization.** The included stores use cosine similarity,
+   and the adapter enables L2 normalization. Keep this setting identical at
+   indexing and query time.
+7. **Operational constraints.** Measure p95 query latency, indexing throughput,
+   model download size, licensing, and whether documents are allowed to leave
+   your environment. A hosted API can simplify operations but adds network,
+   privacy, availability, and per-token cost considerations.
+
+Useful model-size alternatives are `intfloat/multilingual-e5-small` (384
+dimensions, faster and smaller) and `intfloat/multilingual-e5-large` (1024
+dimensions, better quality but heavier). Choose between them from evaluation
+results and your latency/memory budget, not dimensions alone.
+
+## Opt into QASC per query
+
+[Query-Adaptive Semantic Chunking (QASC)](https://arxiv.org/abs/2605.22834)
+constructs query-specific sentence windows around relevant seed sentences. It
+is disabled by default: standard indexing and `app.ask(...)` do not build or
+use the additional sentence index.
+
+Install the optional sentence-segmentation dependency and enable QASC at the
+composition root:
+
+```bash
+pip install -e ".[spacy]"
+```
+
+```python
+from modular_rag import QASCConfig, build_demo_rag
+
+app = build_demo_rag(
+    enable_qasc=True,
+    qasc_config=QASCConfig(
+        seed_percentile=75,
+        window_radius=3,
+        decay=0.3,
+        gap_tolerance=2,
+        chunk_threshold_factor=0.6,
+    ),
+)
+
+# Index once into both the standard chunk index and the optional QASC
+# sentence index.
+app.index(source)
+
+standard_response = app.ask("How does the system authenticate users?")
+qasc_response = app.ask(
+    "How does the system authenticate users?",
+    method="qasc",
+)
+```
+
+The query flag is a general strategy selector, not a QASC-specific branch.
+Register any retriever under its own name when constructing `RAGService`:
+
+```python
+rag = RAGService(
+    standard_retriever,
+    generator,
+    query_methods={
+        "qasc": qasc_retriever,
+        "hybrid": hybrid_retriever,
+    },
+)
+
+response = rag.ask(question, method="hybrid")
+```
+
+`rag.available_methods` reports the enabled choices. `"standard"` is always
+present and remains the default. If another strategy needs its own document
+index, register that component through `Indexer(..., document_indexes=(...))`
+as well as under `query_methods`.
+
 ## Packages
 
 ```text
@@ -91,9 +223,11 @@ src/
 └── modular_rag/
     ├── ports.py           Replaceable component contracts
     ├── models.py          Sentence, chunk, vector, citation, response models
+    ├── embedding.py       Demo hashing and optional local dense embeddings
     ├── chunking.py        Default overlapping word chunker
     ├── indexing.py        Ingest -> chunk -> embed -> store
     ├── retrieval.py       Vector retrieval and optional reranking
+    ├── qasc.py            Optional query-adaptive semantic chunking
     ├── generation.py      Offline demo generator
     ├── service.py         Retrieve -> rerank -> answer -> cite
     ├── factory.py         Dependency-free composition root
@@ -244,7 +378,12 @@ No test-runner dependency is required:
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
+See [`tests/README.md`](tests/README.md) for the behavioral and parameter
+rationale behind the refined contract tests.
+
 Every pull request and every push to `main` installs the package, runs the
 tests, and executes the end-to-end example on the oldest and newest supported
-Python versions. Dependabot checks the Python and GitHub Actions dependencies
-weekly and groups related updates into small pull requests.
+Python versions. A separate Python 3.9 job installs the optional spaCy extra and
+runs the sentence-segmentation suite, so the real adapter integration is not
+left permanently skipped in CI. Dependabot checks the Python and GitHub Actions
+dependencies weekly and groups related updates into small pull requests.

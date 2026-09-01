@@ -5,13 +5,14 @@ from typing import Any, Optional
 
 from rag_ingestion import create_default_pipeline
 
-from .adapters import InMemoryVectorStore
+from .adapters import InMemoryVectorStore, SpacySentenceSegmenter
 from .chunking import WordWindowChunker
 from .embedding import HashingEmbedder
 from .generation import DemoExtractiveGenerator
 from .indexing import Indexer
 from .models import IndexReport, RAGResponse
-from .ports import DocumentProcessor
+from .ports import DocumentProcessor, Embedder, SentenceSegmenter
+from .qasc import QASCConfig, QASCRetriever
 from .retrieval import KeywordReranker, VectorRetriever
 from .service import RAGService
 
@@ -37,20 +38,51 @@ def build_demo_rag(
     overlap_words: int = 30,
     dimensions: int = 256,
     processor: Optional[DocumentProcessor] = None,
+    embedder: Optional[Embedder] = None,
+    enable_qasc: bool = False,
+    qasc_segmenter: Optional[SentenceSegmenter] = None,
+    qasc_config: Optional[QASCConfig] = None,
 ) -> RAGApplication:
-    """Wire local components that make the complete pipeline runnable offline."""
+    """Wire local components that make the complete pipeline runnable offline.
+
+    QASC is opt-in because it maintains an additional sentence index. When it
+    is enabled without a custom segmenter, the optional spaCy adapter is used.
+    """
 
     selected_processor = (
         processor if processor is not None else create_default_pipeline()
     )
     chunker = WordWindowChunker(max_words, overlap_words)
-    embedder = HashingEmbedder(dimensions)
+    selected_embedder = (
+        embedder if embedder is not None else HashingEmbedder(dimensions)
+    )
     store = InMemoryVectorStore()
-    indexer = Indexer(selected_processor, chunker, embedder, store)
-    retriever = VectorRetriever(embedder, store)
+    query_methods = {}
+    document_indexes = ()
+    if enable_qasc:
+        segmenter = (
+            qasc_segmenter
+            if qasc_segmenter is not None
+            else SpacySentenceSegmenter()
+        )
+        qasc = QASCRetriever(segmenter, selected_embedder, config=qasc_config)
+        query_methods["qasc"] = qasc
+        document_indexes = (qasc,)
+    elif qasc_segmenter is not None or qasc_config is not None:
+        raise ValueError("Set enable_qasc=True to configure QASC.")
+
+    indexer = Indexer(
+        selected_processor,
+        chunker,
+        selected_embedder,
+        store,
+        document_indexes=document_indexes,
+    )
+    retriever = VectorRetriever(selected_embedder, store)
     rag = RAGService(
         retriever,
         DemoExtractiveGenerator(),
         reranker=KeywordReranker(),
+        query_methods=query_methods,
     )
     return RAGApplication(indexer=indexer, rag=rag, store=store)

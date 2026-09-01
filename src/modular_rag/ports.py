@@ -28,6 +28,16 @@ class SentenceSegmenter(Protocol):
         ...
 
 
+class DocumentIndex(Protocol):
+    """Optional query-side index populated from canonical documents."""
+
+    def replace_document(self, document: Document) -> None:
+        ...
+
+    def delete_document(self, document_id: str) -> int:
+        ...
+
+
 class Chunker(Protocol):
     def chunk(self, document: Document) -> Sequence[Chunk]:
         ...

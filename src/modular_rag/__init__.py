@@ -2,7 +2,7 @@
 
 from .adapters import InMemoryVectorStore, SpacySentenceSegmenter
 from .chunking import WordWindowChunker
-from .embedding import HashingEmbedder
+from .embedding import HashingEmbedder, SentenceTransformerEmbedder
 from .errors import (
     ComponentContractError,
     OptionalDependencyError,
@@ -25,6 +25,7 @@ from .models import (
 from .ports import (
     AnswerGenerator,
     Chunker,
+    DocumentIndex,
     DocumentProcessor,
     Embedder,
     Reranker,
@@ -32,6 +33,7 @@ from .ports import (
     SentenceSegmenter,
     VectorStore,
 )
+from .qasc import QASCConfig, QASCRetriever
 from .retrieval import KeywordReranker, VectorRetriever
 from .service import RAGService
 
@@ -42,6 +44,7 @@ __all__ = [
     "Citation",
     "ComponentContractError",
     "DemoExtractiveGenerator",
+    "DocumentIndex",
     "DocumentProcessor",
     "Embedder",
     "HashingEmbedder",
@@ -50,6 +53,8 @@ __all__ = [
     "Indexer",
     "KeywordReranker",
     "OptionalDependencyError",
+    "QASCConfig",
+    "QASCRetriever",
     "RAGApplication",
     "RAGError",
     "RAGResponse",
@@ -59,6 +64,7 @@ __all__ = [
     "SearchResult",
     "SentenceSegmenter",
     "SentenceSpan",
+    "SentenceTransformerEmbedder",
     "SpacySentenceSegmenter",
     "Vector",
     "VectorDimensionError",
