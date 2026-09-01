@@ -7,7 +7,7 @@ from rag_ingestion import Document, DocumentSource
 
 from .errors import ComponentContractError
 from .models import IndexReport, VectorRecord
-from .ports import Chunker, DocumentProcessor, Embedder, VectorStore
+from .ports import Chunker, DocumentIndex, DocumentProcessor, Embedder, VectorStore
 
 SourceLike = Union[str, Path, bytes, DocumentSource]
 
@@ -19,11 +19,14 @@ class Indexer:
         chunker: Chunker,
         embedder: Embedder,
         store: VectorStore,
+        *,
+        document_indexes: Sequence[DocumentIndex] = (),
     ) -> None:
         self.processor = processor
         self.chunker = chunker
         self.embedder = embedder
         self.store = store
+        self.document_indexes = tuple(document_indexes)
 
     def index(
         self,
@@ -66,7 +69,12 @@ class Indexer:
             for chunk, vector in zip(chunks, vectors)
         )
         self.store.replace_document(document_id, records)
+        for document_index in self.document_indexes:
+            document_index.replace_document(document)
         return IndexReport(document_id=document_id, chunk_count=len(records))
 
     def delete(self, document_id: str) -> int:
-        return self.store.delete_document(document_id)
+        deleted = self.store.delete_document(document_id)
+        for document_index in self.document_indexes:
+            document_index.delete_document(document_id)
+        return deleted
