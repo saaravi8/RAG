@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "A dependency-light, replaceable skeleton for retrieval-augmented generation"
 readme = "README.md"
 requires-python = ">=3.9"
+dependencies = [
+    "pypdf>=5.1",
+]
 
 [project.optional-dependencies]
 embeddings = [

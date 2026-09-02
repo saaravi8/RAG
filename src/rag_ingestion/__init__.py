@@ -5,6 +5,7 @@ from .builtins import (
     load_csv,
     load_html,
     load_json,
+    load_pdf,
     make_text_loader,
     normalize_text,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "load_csv",
     "load_html",
     "load_json",
+    "load_pdf",
     "make_text_loader",
     "normalize_text",
 ]
