@@ -11,7 +11,7 @@ from .embedding import HashingEmbedder
 from .generation import DemoExtractiveGenerator
 from .indexing import Indexer
 from .models import IndexReport, RAGResponse
-from .ports import DocumentProcessor, Embedder, SentenceSegmenter
+from .ports import DocumentProcessor, Embedder, Reranker, SentenceSegmenter
 from .qasc import QASCConfig, QASCRetriever
 from .retrieval import KeywordReranker, VectorRetriever
 from .service import RAGService
@@ -39,12 +39,15 @@ def build_demo_rag(
     dimensions: int = 256,
     processor: Optional[DocumentProcessor] = None,
     embedder: Optional[Embedder] = None,
+    reranker: Optional[Reranker] = None,
     enable_qasc: bool = False,
     qasc_segmenter: Optional[SentenceSegmenter] = None,
     qasc_config: Optional[QASCConfig] = None,
 ) -> RAGApplication:
     """Wire local components that make the complete pipeline runnable offline.
 
+    The dependency-free keyword reranker remains the default. Supply any
+    ``Reranker`` implementation to replace it without changing orchestration.
     QASC is opt-in because it maintains an additional sentence index. When it
     is enabled without a custom segmenter, the optional spaCy adapter is used.
     """
@@ -82,7 +85,7 @@ def build_demo_rag(
     rag = RAGService(
         retriever,
         DemoExtractiveGenerator(),
-        reranker=KeywordReranker(),
+        reranker=reranker if reranker is not None else KeywordReranker(),
         query_methods=query_methods,
     )
     return RAGApplication(indexer=indexer, rag=rag, store=store)

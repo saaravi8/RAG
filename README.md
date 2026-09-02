@@ -152,6 +152,41 @@ dimensions, faster and smaller) and `intfloat/multilingual-e5-large` (1024
 dimensions, better quality but heavier). Choose between them from evaluation
 results and your latency/memory budget, not dimensions alone.
 
+## Add cross-encoder reranking
+
+Dense retrieval is fast enough to search the full index, while a cross-encoder
+can improve the final ordering by jointly scoring each question and candidate
+chunk. The two stages stay independent: `RAGService` asks the retriever for
+`default_fetch_k` candidates, then asks the configured `Reranker` for the best
+`default_top_k` results.
+
+Install the optional local model runtime:
+
+```bash
+pip install -e ".[reranking]"
+```
+
+Then inject the included adapter through the composition root:
+
+```python
+from modular_rag import CrossEncoderReranker, build_demo_rag
+
+reranker = CrossEncoderReranker(
+    model_name="cross-encoder/ms-marco-MiniLM-L6-v2",
+    batch_size=32,
+)
+app = build_demo_rag(reranker=reranker)
+
+# The service retrieves 20 candidates by default and returns the best 5.
+response = app.ask("How does the system authenticate users?")
+```
+
+The default model is a compact English passage reranker. Select and evaluate a
+multilingual or domain-specific cross-encoder when the corpus requires it.
+Model scores replace the vector-store scores in the final `SearchResult` and
+citation objects. To use a hosted provider instead, implement the small
+`Reranker.rerank(...)` protocol and inject that adapter in the same place.
+
 ## Opt into QASC per query
 
 [Query-Adaptive Semantic Chunking (QASC)](https://arxiv.org/abs/2605.22834)
@@ -384,12 +419,13 @@ class CustomSentenceSegmenter:
   replaces its previous chunks, preventing stale retrieval results.
 - Preserve `source_name`, page numbers, headings, and bounding boxes in chunk
   metadata when a parser provides them.
-- Retrieval scores are store-specific. Do not treat scores from different
-  backends as directly comparable.
+- Scores come from the latest ranking stage (the retriever or, when enabled,
+  the reranker). Do not treat scores from different backends as directly
+  comparable.
 - The default filters use exact metadata equality. A production store must
   implement equivalent filtering before results are returned.
-- `DemoExtractiveGenerator` and `HashingEmbedder` prove the wiring only; they
-  are not substitutes for production embedding and generation models.
+- `DemoExtractiveGenerator`, `HashingEmbedder`, and `KeywordReranker` prove the
+  wiring only; they are not substitutes for production models.
 
 ## Test
 

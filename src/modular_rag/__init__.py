@@ -34,7 +34,7 @@ from .ports import (
     VectorStore,
 )
 from .qasc import QASCConfig, QASCRetriever
-from .retrieval import KeywordReranker, VectorRetriever
+from .retrieval import CrossEncoderReranker, KeywordReranker, VectorRetriever
 from .service import RAGService
 
 __all__ = [
@@ -43,6 +43,7 @@ __all__ = [
     "Chunker",
     "Citation",
     "ComponentContractError",
+    "CrossEncoderReranker",
     "DemoExtractiveGenerator",
     "DocumentIndex",
     "DocumentProcessor",
