@@ -71,7 +71,7 @@ class VectorRecord:
 
 @dataclass(frozen=True)
 class SearchResult:
-    """A retrieved chunk and its store-defined relevance score."""
+    """A retrieved chunk and its latest retrieval or reranking score."""
 
     chunk: Chunk
     score: float

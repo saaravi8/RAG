@@ -67,6 +67,17 @@ test expansion.
 | `test_citations_normalize_excerpts_and_apply_source_fallbacks` | Citation numbering, readable excerpts, and provenance fallback | Two results are the minimum for numbering; scores `0.9` and `0.8` keep their order deterministic but are not acceptance thresholds; missing source metadata on the second result forces document-ID fallback. |
 | `test_qasc_configuration_requires_explicit_enablement` | Optional indexing cost cannot be activated accidentally | Segmenter-only and config-only cases cover both optional arguments independently while leaving `enable_qasc` at its explicit default `False`. |
 
+## Cross-encoder reranking
+
+| Test | What it protects | Parameter rationale |
+| --- | --- | --- |
+| `test_scores_query_chunk_pairs_and_returns_the_best_results` | The adapter sends the correct pairs, honors inference settings, ranks by model relevance, and exposes those final scores | Three candidates make the reordering visible; `top_k=2` proves truncation happens after all candidate scores are considered; batch size `8` is distinct from both counts so argument forwarding is observable. |
+| `test_equal_scores_preserve_retrieval_order` | Model ties remain deterministic without inventing a secondary relevance signal | Two equal `0.5` scores are the minimum tie; reverse-alphabetical IDs prove the original retrieval order, rather than chunk identity, resolves it. |
+| `test_empty_candidates_skip_model_inference` | Empty retrieval results do not trigger unnecessary model calls | An empty tuple is the exact no-evidence boundary while a positive limit keeps validation separate. |
+| `test_rejects_invalid_configuration_and_limits` | Model injection and all positive-size boundaries fail early | Zero is the lower boundary for batch, sequence, and result sizes; `object()` isolates the required `predict` capability. |
+| `test_rejects_malformed_model_scores` | Provider output has one finite scalar per candidate | One candidate paired with zero scores, a nested score, and NaN independently exercises count, shape, and finiteness validation. |
+| `test_factory_accepts_an_injected_reranker` | The composition root keeps the reranker replaceable | Identity comparison proves the supplied adapter reaches `RAGService` unchanged without requiring model inference. |
+
 ## QASC contracts
 
 | Test | What it protects | Parameter rationale |
