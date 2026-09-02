@@ -9,6 +9,9 @@ test expansion.
 
 | Test | What it protects | Parameter rationale |
 | --- | --- | --- |
+| `test_pdf_loader_reports_pages_and_empty_pages` | PDF routing, page accounting, document metadata, and source provenance | A one-page blank PDF is generated in memory with `pypdf`; it deterministically exercises the empty-page path without checking parser-specific text layout, while title and author verify useful metadata extraction. |
+| `test_pdf_loader_extracts_text_with_a_page_label` | Embedded PDF text is extracted and retains its human-readable page reference | A minimal one-page Helvetica PDF contains a single unique phrase, avoiding layout ambiguity while exercising the real `pypdf` parser. |
+| `test_default_pipeline_ingests_supported_file_paths` | PDF, TXT, CSV, and HTML all work through the filesystem entry point | One minimal file per requested format verifies suffix routing, extracted text, and `source_path` provenance without involving retrieval ranking. |
 | `test_text_normalization_handles_unicode_cr_and_outer_blank_lines` | NFC normalization, classic-Mac newlines, trailing spaces, and outer blank removal | A decomposed `e` + acute accent proves NFC composition; `\r` isolates CR conversion from the already-covered CRLF case; two outer CRs prove blank trimming without changing internal prose. |
 | `test_json_loader_preserves_unicode_and_reports_non_object_roots` | Readable Unicode and correct root metadata for JSON arrays | A two-item array is the smallest non-object root containing both Unicode text and a nested object; `42` is a stable scalar with no formatting ambiguity. |
 | `test_json_loader_rejects_malformed_input` | Invalid structured data is not silently indexed | `{"broken":` is valid enough to enter JSON parsing but necessarily incomplete, producing the standard `JSONDecodeError`. |

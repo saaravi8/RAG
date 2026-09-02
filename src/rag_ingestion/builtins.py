@@ -8,6 +8,8 @@ import unicodedata
 from html.parser import HTMLParser
 from typing import Callable
 
+from pypdf import PdfReader
+
 from .models import Document, DocumentSource
 from .pipeline import DocumentPipeline
 
@@ -23,6 +25,46 @@ def make_text_loader(encoding: str = "utf-8") -> Callable[[DocumentSource], Docu
         )
 
     return load_text
+
+
+def load_pdf(source: DocumentSource) -> Document:
+    """Extract text and basic provenance from a text-based PDF.
+
+    Page labels are included in the rendered text so retrieved chunks retain a
+    human-readable connection to their source page. Image-only pages are
+    reported in metadata; OCR is intentionally left to a dedicated adapter.
+    """
+
+    assert source.document_type is not None
+    reader = PdfReader(io.BytesIO(source.read_bytes()), strict=False)
+    rendered_pages = []
+    empty_pages = []
+
+    for page_number, page in enumerate(reader.pages, start=1):
+        text = page.extract_text() or ""
+        if not text.strip():
+            empty_pages.append(page_number)
+            continue
+        rendered_pages.append("Page {}\n{}".format(page_number, text.strip()))
+
+    metadata = {
+        "page_count": len(reader.pages),
+        "pages_with_text": len(rendered_pages),
+        "empty_pages": tuple(empty_pages),
+        "encrypted": bool(reader.is_encrypted),
+    }
+    pdf_metadata = reader.metadata
+    if pdf_metadata:
+        if pdf_metadata.title:
+            metadata["title"] = str(pdf_metadata.title)
+        if pdf_metadata.author:
+            metadata["author"] = str(pdf_metadata.author)
+
+    return Document(
+        text="\n\n".join(rendered_pages),
+        document_type=source.document_type,
+        metadata=metadata,
+    )
 
 
 def load_json(source: DocumentSource) -> Document:
@@ -201,12 +243,13 @@ def normalize_text(document: Document) -> Document:
 
 
 def create_default_pipeline() -> DocumentPipeline:
-    """Create an isolated pipeline with common dependency-free formats."""
+    """Create an isolated pipeline with the built-in document formats."""
 
     pipeline = DocumentPipeline()
     text_loader = make_text_loader()
     for document_type in ("txt", "md", "markdown"):
         pipeline.register_loader(document_type, text_loader)
+    pipeline.register_loader("pdf", load_pdf)
     pipeline.register_loader("json", load_json)
     pipeline.register_loader("csv", load_csv)
     for document_type in ("htm", "html"):

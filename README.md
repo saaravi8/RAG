@@ -4,7 +4,7 @@
 
 A small, runnable retrieval-augmented generation foundation designed so each
 piece can be replaced independently. The core contains no model-provider,
-database, web-framework, or document-parser dependency.
+database, or web-framework dependency. PDF text extraction uses `pypdf`.
 
 The included hashing embedder, in-memory vector store, and extractive answer
 generator are intentionally development-only components. They let the complete
@@ -293,8 +293,29 @@ to `Vector`, `SearchResult`, and strings at the adapter boundary.
 
 ## Add document formats and cleaners
 
-The ingestion package supports `txt`, `md`, `markdown`, `json`, `csv`, `htm`,
-and `html` by default. The active list is always available from
+The ingestion package supports PDF, plain text, Markdown, JSON, CSV, and HTML
+files by default. Pass a file path directly to the application; its suffix
+selects the loader:
+
+```python
+from modular_rag import build_demo_rag
+
+app = build_demo_rag()
+app.index(
+    "documents/handbook.pdf",
+    metadata={"document_id": "handbook", "tenant_id": "acme"},
+)
+app.index("documents/notes.txt")
+app.index("documents/products.csv")
+app.index("documents/help.html")
+```
+
+PDF ingestion extracts embedded text, labels it by page, and records the page
+count and any pages without extractable text. Scanned/image-only PDFs need an
+OCR-capable custom loader. CSV rows are rendered with their column labels, and
+HTML ingestion keeps visible text while excluding scripts and styles.
+
+The exact active extensions are available from
 `processor.supported_document_types`. New handlers are ordinary functions:
 
 ```python
@@ -303,17 +324,17 @@ from rag_ingestion import Document, create_default_pipeline
 
 processor = create_default_pipeline()
 
-@processor.register_loader("pdf")
-def load_pdf(source):
-    parsed = my_pdf_parser(source.read_bytes())
+@processor.register_loader("docx")
+def load_docx(source):
+    parsed = my_docx_parser(source.read_bytes())
     return Document(
         text=parsed.text,
         document_type=source.document_type,
-        metadata={"page_count": parsed.page_count},
+        metadata={"heading_count": parsed.heading_count},
     )
 
-@processor.register_cleaner("pdf")
-def clean_pdf(document):
+@processor.register_cleaner("docx")
+def clean_docx(document):
     return document.with_text(remove_repeated_headers(document.text))
 
 # Pass this configured beginning of the pipeline into the application.
