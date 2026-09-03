@@ -187,6 +187,37 @@ Model scores replace the vector-store scores in the final `SearchResult` and
 citation objects. To use a hosted provider instead, implement the small
 `Reranker.rerank(...)` protocol and inject that adapter in the same place.
 
+## Prepare answer verification
+
+`AnswerVerifier` defines a provider-neutral boundary for checking whether a
+generated answer is supported by the exact retrieved contexts used during
+generation. Implementations return a `VerificationResult` with a boolean
+support verdict, a human-readable reason, and optional provider diagnostics.
+
+```python
+from modular_rag import VerificationResult
+
+
+class ProviderAnswerVerifier:
+    def verify(self, question, answer, contexts):
+        verdict = self.client.verify(
+            question=question,
+            answer=answer,
+            contexts=[result.chunk.text for result in contexts],
+        )
+        return VerificationResult(
+            supported=verdict.supported,
+            reason=verdict.reason,
+            metadata={"provider": "example"},
+        )
+```
+
+The contract is intentionally separate from `RAGService` in this first slice:
+answers are not verified or blocked yet, so existing applications behave
+exactly as before. A follow-up can inject the verifier after generation and
+add explicit report or enforcement policies without coupling the core to a
+model provider.
+
 ## Opt into QASC per query
 
 [Query-Adaptive Semantic Chunking (QASC)](https://arxiv.org/abs/2605.22834)
@@ -256,8 +287,8 @@ src/
 │   ├── registry.py        Dynamic loader and cleaner registries
 │   └── pipeline.py        Load -> clean orchestration
 └── modular_rag/
-    ├── ports.py           Replaceable component contracts
-    ├── models.py          Sentence, chunk, vector, citation, response models
+    ├── ports.py           Replaceable component contracts, including verification
+    ├── models.py          Sentence, chunk, vector, citation, verification, response models
     ├── embedding.py       Demo hashing and optional local dense embeddings
     ├── chunking.py        Default overlapping word chunker
     ├── indexing.py        Ingest -> chunk -> embed -> store

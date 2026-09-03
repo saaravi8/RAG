@@ -4,7 +4,14 @@ from typing import Any, Mapping, Optional, Protocol, Sequence
 
 from rag_ingestion import Document
 
-from .models import Chunk, SearchResult, SentenceSpan, Vector, VectorRecord
+from .models import (
+    Chunk,
+    SearchResult,
+    SentenceSpan,
+    Vector,
+    VectorRecord,
+    VerificationResult,
+)
 
 
 class DocumentProcessor(Protocol):
@@ -92,4 +99,16 @@ class Reranker(Protocol):
 
 class AnswerGenerator(Protocol):
     def generate(self, question: str, contexts: Sequence[SearchResult]) -> str:
+        ...
+
+
+class AnswerVerifier(Protocol):
+    """Check whether a generated answer is supported by its retrieved contexts."""
+
+    def verify(
+        self,
+        question: str,
+        answer: str,
+        contexts: Sequence[SearchResult],
+    ) -> VerificationResult:
         ...

@@ -102,6 +102,22 @@ class Citation:
 
 
 @dataclass(frozen=True)
+class VerificationResult:
+    """Provider-neutral support verdict returned by an answer verifier."""
+
+    supported: bool
+    reason: str = ""
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.supported, bool):
+            raise TypeError("VerificationResult.supported must be a boolean.")
+        if not isinstance(self.reason, str):
+            raise TypeError("VerificationResult.reason must be a string.")
+        object.__setattr__(self, "metadata", dict(self.metadata))
+
+
+@dataclass(frozen=True)
 class RAGResponse:
     """The answer plus the exact retrieved evidence used to produce it."""
 

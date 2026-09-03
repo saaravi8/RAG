@@ -3,6 +3,7 @@ import unittest
 from rag_ingestion import Document
 
 from modular_rag import (
+    AnswerVerifier,
     Chunk,
     ComponentContractError,
     HashingEmbedder,
@@ -13,6 +14,7 @@ from modular_rag import (
     SearchResult,
     VectorDimensionError,
     VectorRecord,
+    VerificationResult,
     WordWindowChunker,
     build_demo_rag,
 )
@@ -216,6 +218,50 @@ class EmbedderContractTests(unittest.TestCase):
             with self.subTest(dimensions=dimensions):
                 with self.assertRaisesRegex(ValueError, "dimensions must be positive"):
                     HashingEmbedder(dimensions)
+
+
+class AnswerVerifierContractTests(unittest.TestCase):
+    def test_structural_verifier_receives_the_answer_and_exact_contexts(self):
+        """Verifier adapters need no inheritance and receive generation evidence unchanged."""
+
+        class RecordingVerifier:
+            def __init__(self):
+                self.calls = []
+
+            def verify(self, question, answer, contexts):
+                self.calls.append((question, answer, tuple(contexts)))
+                return VerificationResult(True, "supported by the supplied context")
+
+        contexts = (
+            SearchResult(Chunk("c1", "guide", "supporting evidence", 0), 0.9),
+        )
+        verifier: AnswerVerifier = RecordingVerifier()
+
+        result = verifier.verify("question", "answer", contexts)
+
+        self.assertEqual(verifier.calls, [("question", "answer", contexts)])
+        self.assertTrue(result.supported)
+        self.assertEqual(result.reason, "supported by the supplied context")
+
+    def test_verification_result_validates_fields_and_snapshots_metadata(self):
+        """Verifier output has an unambiguous verdict and stable top-level diagnostics."""
+
+        metadata = {"provider": "example"}
+        result = VerificationResult(False, "claim is unsupported", metadata)
+        metadata["provider"] = "changed"
+
+        self.assertFalse(result.supported)
+        self.assertEqual(result.reason, "claim is unsupported")
+        self.assertEqual(result.metadata, {"provider": "example"})
+
+        invalid_fields = (
+            ({"supported": 1}, TypeError, "supported"),
+            ({"supported": True, "reason": None}, TypeError, "reason"),
+        )
+        for arguments, error, message in invalid_fields:
+            with self.subTest(arguments=arguments):
+                with self.assertRaisesRegex(error, message):
+                    VerificationResult(**arguments)
 
 
 class RAGServiceContractTests(unittest.TestCase):
