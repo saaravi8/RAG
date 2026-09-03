@@ -21,9 +21,11 @@ from .models import (
     SentenceSpan,
     Vector,
     VectorRecord,
+    VerificationResult,
 )
 from .ports import (
     AnswerGenerator,
+    AnswerVerifier,
     Chunker,
     DocumentIndex,
     DocumentProcessor,
@@ -39,6 +41,7 @@ from .service import RAGService
 
 __all__ = [
     "AnswerGenerator",
+    "AnswerVerifier",
     "Chunk",
     "Chunker",
     "Citation",
@@ -72,6 +75,7 @@ __all__ = [
     "VectorRecord",
     "VectorRetriever",
     "VectorStore",
+    "VerificationResult",
     "WordWindowChunker",
     "build_demo_rag",
 ]
