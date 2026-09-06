@@ -68,3 +68,36 @@ jobs:
 
       - name: Run the sentence-segmentation tests
         run: python -m unittest discover -s tests -p 'test_sentence_segmentation.py' -v
+
+  code-adapter:
+    name: Optional code parser (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.9"
+          - "3.14"
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the package with code parsing support
+        run: python -m pip install '.[code]'
+
+      - name: Run the code and repository ingestion tests
+        run: >-
+          python -m unittest
+          tests.test_code
+          tests.test_repository
+          -v
