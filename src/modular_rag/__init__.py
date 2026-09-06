@@ -2,11 +2,22 @@
 
 from .adapters import InMemoryVectorStore, SpacySentenceSegmenter
 from .chunking import WordWindowChunker
+from .code import (
+    BuiltinSyntaxParser,
+    CodeChunker,
+    RoutingChunker,
+    SyntaxParseResult,
+    SyntaxSpan,
+    TreeSitterSyntaxParser,
+)
 from .embedding import HashingEmbedder, SentenceTransformerEmbedder
 from .errors import (
     ComponentContractError,
     OptionalDependencyError,
     RAGError,
+    RepositoryIngestionError,
+    RepositoryResourceLimitError,
+    UnsafeRepositoryError,
     VectorDimensionError,
 )
 from .factory import RAGApplication, build_demo_rag
@@ -36,16 +47,31 @@ from .ports import (
     VectorStore,
 )
 from .qasc import QASCConfig, QASCRetriever
+from .repository import (
+    DefaultSecretScanner,
+    InMemoryRepositoryManifest,
+    RepositoryIndexReport,
+    RepositoryIndexer,
+    RepositoryIssue,
+    RepositoryLimits,
+    RepositoryManifest,
+    RepositoryManifestEntry,
+    RepositoryPolicy,
+    SecretScanResult,
+    SecretScanner,
+)
 from .retrieval import CrossEncoderReranker, KeywordReranker, VectorRetriever
 from .service import RAGService
 
 __all__ = [
     "AnswerGenerator",
     "AnswerVerifier",
+    "BuiltinSyntaxParser",
     "Chunk",
     "Chunker",
     "Citation",
     "ComponentContractError",
+    "CodeChunker",
     "CrossEncoderReranker",
     "DemoExtractiveGenerator",
     "DocumentIndex",
@@ -53,6 +79,7 @@ __all__ = [
     "Embedder",
     "HashingEmbedder",
     "InMemoryVectorStore",
+    "InMemoryRepositoryManifest",
     "IndexReport",
     "Indexer",
     "KeywordReranker",
@@ -65,11 +92,27 @@ __all__ = [
     "RAGService",
     "Reranker",
     "Retriever",
+    "RepositoryIndexReport",
+    "RepositoryIndexer",
+    "RepositoryIngestionError",
+    "RepositoryIssue",
+    "RepositoryLimits",
+    "RepositoryManifest",
+    "RepositoryManifestEntry",
+    "RepositoryPolicy",
+    "RepositoryResourceLimitError",
+    "RoutingChunker",
     "SearchResult",
     "SentenceSegmenter",
     "SentenceSpan",
     "SentenceTransformerEmbedder",
+    "SecretScanResult",
+    "SecretScanner",
     "SpacySentenceSegmenter",
+    "SyntaxParseResult",
+    "SyntaxSpan",
+    "TreeSitterSyntaxParser",
+    "UnsafeRepositoryError",
     "Vector",
     "VectorDimensionError",
     "VectorRecord",
@@ -78,4 +121,5 @@ __all__ = [
     "VerificationResult",
     "WordWindowChunker",
     "build_demo_rag",
+    "DefaultSecretScanner",
 ]

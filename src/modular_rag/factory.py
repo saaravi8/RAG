@@ -6,6 +6,7 @@ from typing import Any, Optional
 from rag_ingestion import create_default_pipeline
 
 from .adapters import InMemoryVectorStore, SpacySentenceSegmenter
+from .code import CodeChunker, RoutingChunker
 from .chunking import WordWindowChunker
 from .embedding import HashingEmbedder
 from .generation import DemoExtractiveGenerator
@@ -13,6 +14,13 @@ from .indexing import Indexer
 from .models import IndexReport, RAGResponse
 from .ports import DocumentProcessor, Embedder, Reranker, SentenceSegmenter
 from .qasc import QASCConfig, QASCRetriever
+from .repository import (
+    InMemoryRepositoryManifest,
+    RepositoryIndexReport,
+    RepositoryIndexer,
+    RepositoryManifest,
+    RepositoryPolicy,
+)
 from .retrieval import KeywordReranker, VectorRetriever
 from .service import RAGService
 
@@ -24,12 +32,20 @@ class RAGApplication:
     indexer: Indexer
     rag: RAGService
     store: InMemoryVectorStore
+    repository_indexer: Optional[RepositoryIndexer] = None
 
     def index(self, source: Any, **kwargs: Any) -> IndexReport:
         return self.indexer.index(source, **kwargs)
 
     def ask(self, question: str, **kwargs: Any) -> RAGResponse:
         return self.rag.ask(question, **kwargs)
+
+    def index_repository(self, source: Any, **kwargs: Any) -> RepositoryIndexReport:
+        """Index a local Git working tree when a repository indexer is configured."""
+
+        if self.repository_indexer is None:
+            raise RuntimeError("Repository indexing is not configured.")
+        return self.repository_indexer.index_repository(source, **kwargs)
 
 
 def build_demo_rag(
@@ -40,6 +56,11 @@ def build_demo_rag(
     processor: Optional[DocumentProcessor] = None,
     embedder: Optional[Embedder] = None,
     reranker: Optional[Reranker] = None,
+    code_parser: Optional[Any] = None,
+    code_max_lines: int = 200,
+    code_overlap_lines: int = 20,
+    repository_manifest: Optional[RepositoryManifest] = None,
+    repository_policy: Optional[RepositoryPolicy] = None,
     enable_qasc: bool = False,
     qasc_segmenter: Optional[SentenceSegmenter] = None,
     qasc_config: Optional[QASCConfig] = None,
@@ -55,7 +76,14 @@ def build_demo_rag(
     selected_processor = (
         processor if processor is not None else create_default_pipeline()
     )
-    chunker = WordWindowChunker(max_words, overlap_words)
+    chunker = RoutingChunker(
+        WordWindowChunker(max_words, overlap_words),
+        CodeChunker(
+            max_lines=code_max_lines,
+            overlap_lines=code_overlap_lines,
+            parser=code_parser,
+        ),
+    )
     selected_embedder = (
         embedder if embedder is not None else HashingEmbedder(dimensions)
     )
@@ -88,4 +116,18 @@ def build_demo_rag(
         reranker=reranker if reranker is not None else KeywordReranker(),
         query_methods=query_methods,
     )
-    return RAGApplication(indexer=indexer, rag=rag, store=store)
+    repository_indexer = RepositoryIndexer(
+        indexer,
+        manifest=(
+            repository_manifest
+            if repository_manifest is not None
+            else InMemoryRepositoryManifest()
+        ),
+        policy=repository_policy,
+    )
+    return RAGApplication(
+        indexer=indexer,
+        rag=rag,
+        store=store,
+        repository_indexer=repository_indexer,
+    )

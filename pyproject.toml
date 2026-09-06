@@ -9,6 +9,7 @@ description = "A dependency-light, replaceable skeleton for retrieval-augmented 
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
+    "pathspec>=0.12.1,<2",
     "pypdf>=5.1",
 ]
 
@@ -18,6 +19,11 @@ embeddings = [
 ]
 reranking = [
     "sentence-transformers>=3",
+]
+code = [
+    "tree-sitter-language-pack>=1.12.3,<2; python_version >= '3.10'",
+    "tree-sitter-languages==1.10.2; python_version == '3.9'",
+    "tree-sitter==0.21.3; python_version == '3.9'",
 ]
 spacy = [
     "spacy>=3.7.5,<3.8; python_version == '3.9'",
