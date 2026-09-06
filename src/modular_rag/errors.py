@@ -15,3 +15,15 @@ class OptionalDependencyError(RAGError, ImportError):
 
 class VectorDimensionError(RAGError, ValueError):
     """Raised when vector dimensions are inconsistent."""
+
+
+class RepositoryIngestionError(RAGError, ValueError):
+    """Base error for an unsafe or invalid repository ingestion request."""
+
+
+class UnsafeRepositoryError(RepositoryIngestionError):
+    """Raised when a repository root or path violates the containment policy."""
+
+
+class RepositoryResourceLimitError(RepositoryIngestionError):
+    """Raised before indexing work would exceed a configured resource limit."""

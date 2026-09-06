@@ -5,7 +5,7 @@ from typing import Any, Mapping, Optional, Sequence, Union
 
 from rag_ingestion import Document, DocumentSource
 
-from .errors import ComponentContractError
+from .errors import ComponentContractError, RepositoryResourceLimitError
 from .models import IndexReport, VectorRecord
 from .ports import Chunker, DocumentIndex, DocumentProcessor, Embedder, VectorStore
 
@@ -44,10 +44,24 @@ class Indexer:
         )
         return self.index_document(document)
 
-    def index_document(self, document: Document) -> IndexReport:
+    def index_document(
+        self, document: Document, *, max_chunks: Optional[int] = None
+    ) -> IndexReport:
+        """Chunk, embed, and replace one canonical document.
+
+        ``max_chunks`` rejects an oversized chunk batch before embedding or
+        storage, allowing repository ingestion to enforce per-file bounds.
+        """
+
+        if max_chunks is not None and max_chunks <= 0:
+            raise ValueError("max_chunks must be positive when supplied.")
         chunks = tuple(self.chunker.chunk(document))
         if not chunks:
             raise ComponentContractError("Chunker returned no chunks for the document.")
+        if max_chunks is not None and len(chunks) > max_chunks:
+            raise RepositoryResourceLimitError(
+                "Document chunk count exceeds the configured limit."
+            )
 
         document_ids = {chunk.document_id for chunk in chunks}
         if len(document_ids) != 1:
