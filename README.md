@@ -15,16 +15,15 @@ pipeline run offline while real adapters are being built.
 ```text
 WRITE SIDE
 
-file / bytes / upload
+file / bytes / upload -> loader registry -> cleaner chain      rag_ingestion
+local Git tree -> safe discovery -> secret screening           RepositoryIndexer
+        |                              |
+        +---------------+--------------+
+                        v
+                canonical Document
         |
         v
-loader registry -> cleaner chain       rag_ingestion
-        |
-        v
-canonical Document
-        |
-        v
-     Chunker -> Embedder -> VectorStore             Indexer
+RoutingChunker -> Embedder -> VectorStore                         Indexer
 
 
 QUERY SIDE
@@ -44,8 +43,15 @@ through their constructors; changing a provider does not change orchestration.
 ## Run the example
 
 ```bash
-PYTHONPATH=src python3 examples/basic.py
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+python examples/basic.py
 ```
+
+On Windows, activate the environment with `.venv\Scripts\activate` instead.
+The editable install includes required ingestion dependencies and makes both
+packages importable without setting `PYTHONPATH` manually.
 
 Or use the composition root directly:
 
@@ -218,6 +224,79 @@ exactly as before. A follow-up can inject the verifier after generation and
 add explicit report or enforcement policies without coupling the core to a
 model provider.
 
+## Index a local code repository
+
+Repository ingestion discovers a bounded local Git working tree, screens each
+candidate before indexing, and routes source/configuration files through
+line- and syntax-aware chunking. It never clones repositories, follows
+symlinks, imports modules, or executes repository code.
+
+```python
+from modular_rag import RepositoryLimits, RepositoryPolicy, build_demo_rag
+
+app = build_demo_rag(
+    code_max_lines=160,
+    code_overlap_lines=20,
+    repository_policy=RepositoryPolicy(
+        limits=RepositoryLimits(
+            max_files=5_000,
+            max_file_bytes=1_000_000,
+            max_total_bytes=50_000_000,
+        )
+    ),
+)
+
+report = app.index_repository(
+    "/absolute/path/to/local/repository",
+    repository_id="payments-service",
+)
+
+response = app.ask(
+    "Where is authentication configured?",
+    filters={"repository_id": "payments-service"},
+)
+```
+
+`repository_id` is a stable application identity, not a path. Reuse it when
+refreshing the same repository. A complete refresh deletes indexed files that
+no longer exist; if discovery stops at a resource limit, previously indexed
+files that were not observed are preserved.
+
+The default policy:
+
+- respects `.gitignore` rules and excludes VCS metadata, dependency trees,
+  caches, build output, generated directories, lockfiles, binaries, symlinks,
+  and unknown file types;
+- rejects conventional credential files and content under `.ssh/` or
+  `secrets/` directories;
+- redacts high-confidence private keys, cloud access keys, credential
+  assignments, and credential-bearing URLs before embedding;
+- attaches repository, path, language, line, symbol, parser, trust, redaction,
+  and suspected prompt-injection metadata to chunks; and
+- applies hard limits to discovery depth, file/byte/line/chunk counts, errors,
+  and metadata length.
+
+Secret detection is defense in depth, not a guarantee. Only index repositories
+you are authorized to read, keep retrieval filters in trusted application
+code, and never place secrets in source control. Repository content always has
+`content_trust="untrusted_repository"`; a prompt-injection flag is a warning
+for downstream policy and does not make the text trusted.
+
+The dependency-free baseline uses Python's AST and conservative declaration
+patterns, then falls back to bounded line windows. For richer multi-language
+parsing, install the optional Tree-sitter adapter:
+
+```bash
+python -m pip install -e ".[code]"
+```
+
+Repository ingestion does not download grammars. Provision them separately or
+inject a trusted parser factory. The default manifest is in memory; inject a
+persistent `RepositoryManifest` in production. Only repositories with a real
+`.git` directory are accepted currently, so linked Git worktrees are not yet
+supported. `commit_sha` identifies `HEAD`, while `snapshot_kind="working_tree"`
+warns that indexed content may also include uncommitted files.
+
 ## Opt into QASC per query
 
 [Query-Adaptive Semantic Chunking (QASC)](https://arxiv.org/abs/2605.22834)
@@ -291,7 +370,9 @@ src/
     ├── models.py          Sentence, chunk, vector, citation, verification, response models
     ├── embedding.py       Demo hashing and optional local dense embeddings
     ├── chunking.py        Default overlapping word chunker
+    ├── code.py            Non-executing syntax-aware repository chunking
     ├── indexing.py        Ingest -> chunk -> embed -> store
+    ├── repository.py      Safe repository discovery, screening, and manifests
     ├── retrieval.py       Vector retrieval and optional reranking
     ├── qasc.py            Optional query-adaptive semantic chunking
     ├── generation.py      Offline demo generator
@@ -455,6 +536,12 @@ class CustomSentenceSegmenter:
   comparable.
 - The default filters use exact metadata equality. A production store must
   implement equivalent filtering before results are returned.
+- Treat all repository text as untrusted input even after secret redaction.
+  Enforce tenant/repository filters outside the model and inspect
+  `prompt_injection_suspected` according to application policy.
+- Persist the repository manifest alongside a production vector store so
+  refreshes can remove deleted files without confusing transient failures with
+  intentional deletion.
 - `DemoExtractiveGenerator`, `HashingEmbedder`, and `KeywordReranker` prove the
   wiring only; they are not substitutes for production models.
 
