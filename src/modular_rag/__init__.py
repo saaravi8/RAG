@@ -39,12 +39,17 @@ from .ports import (
     AnswerGenerator,
     AnswerVerifier,
     Chunker,
+    CoordinatedPreparedDocumentReplacement,
     DocumentIndex,
     DocumentProcessor,
     Embedder,
+    PreparedDocumentDeletion,
+    PreparedDocumentReplacement,
     Reranker,
     Retriever,
     SentenceSegmenter,
+    TransactionalDocumentIndex,
+    TransactionalVectorStore,
     VectorStore,
 )
 from .qasc import QASCConfig, QASCRetriever
@@ -63,6 +68,7 @@ from .repository import (
 )
 from .retrieval import CrossEncoderReranker, KeywordReranker, VectorRetriever
 from .service import RAGService
+from .transactions import IndexTransactionCoordinator
 
 __all__ = [
     "AnswerGenerator",
@@ -72,6 +78,7 @@ __all__ = [
     "Chunker",
     "Citation",
     "ComponentContractError",
+    "CoordinatedPreparedDocumentReplacement",
     "CodeChunker",
     "CrossEncoderReranker",
     "DemoExtractiveGenerator",
@@ -84,9 +91,12 @@ __all__ = [
     "INDEX_SCHEMA_VERSION",
     "IndexReport",
     "IndexFingerprint",
+    "IndexTransactionCoordinator",
     "Indexer",
     "KeywordReranker",
     "OptionalDependencyError",
+    "PreparedDocumentReplacement",
+    "PreparedDocumentDeletion",
     "QASCConfig",
     "QASCRetriever",
     "RAGApplication",
@@ -115,6 +125,8 @@ __all__ = [
     "SyntaxParseResult",
     "SyntaxSpan",
     "TreeSitterSyntaxParser",
+    "TransactionalDocumentIndex",
+    "TransactionalVectorStore",
     "UnsafeRepositoryError",
     "Vector",
     "VectorDimensionError",

@@ -182,19 +182,68 @@ class IndexerContractTests(unittest.TestCase):
         """Optional query indexes must follow the primary vector-store lifecycle."""
 
         class RecordingDocumentIndex:
-            def __init__(self):
+            def __init__(self, transaction_coordinator):
                 self.replaced = []
                 self.deleted = []
+                self.transaction_coordinator = transaction_coordinator
+
+            def prepare_replace_document(self, document):
+                owner = self
+                previous = list(self.replaced)
+
+                class PreparedReplacement:
+                    def __init__(self):
+                        self.committed = False
+                        self.rolled_back = False
+
+                    def commit(self):
+                        owner.replaced.append(document)
+                        self.committed = True
+
+                    def rollback(self):
+                        if self.rolled_back:
+                            return
+                        if self.committed:
+                            owner.replaced[:] = previous
+                        self.rolled_back = True
+
+                return PreparedReplacement()
 
             def replace_document(self, document):
-                self.replaced.append(document)
+                replacement = self.prepare_replace_document(document)
+                replacement.commit()
+
+            def prepare_delete_document(self, document_id):
+                owner = self
+                previous = list(self.replaced)
+                deleted_count = len(self.replaced)
+
+                class PreparedDeletion:
+                    def __init__(self):
+                        self.committed = False
+                        self.rolled_back = False
+                        self.deleted_count = deleted_count
+
+                    def commit(self):
+                        owner.deleted.append(document_id)
+                        self.committed = True
+
+                    def rollback(self):
+                        if self.rolled_back:
+                            return
+                        if self.committed:
+                            owner.deleted.pop()
+                        self.rolled_back = True
+
+                return PreparedDeletion()
 
             def delete_document(self, document_id):
-                self.deleted.append(document_id)
-                return 1
+                deletion = self.prepare_delete_document(document_id)
+                deletion.commit()
+                return deletion.deleted_count
 
-        auxiliary = RecordingDocumentIndex()
         store = InMemoryVectorStore()
+        auxiliary = RecordingDocumentIndex(store.transaction_coordinator)
         indexer = Indexer(
             object(),
             WordWindowChunker(max_words=10, overlap_words=0),
