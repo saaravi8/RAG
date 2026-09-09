@@ -11,3 +11,7 @@ Content-shaping adapters expose deterministic configuration descriptions. Opaque
 ## Coordinated indexing
 
 Primary storage and QASC share prepare/commit/rollback ownership. Invalid vectors, chunks and sentence spans fail before replacing evidence. Regression tests inject participant failures and concurrent replacement, and check fingerprints. Custom multi-index adapters must implement coordinated transactions.
+
+## Repository lifecycle
+
+Repository manifests participate in coordinated writes. Reuse requires configuration and physical evidence state to match. Bounded discovery loads ignore rules before limiting files and preserves unseen evidence. Tests cover rollback, stale cleanup, reuse invalidation and incremental state updates.

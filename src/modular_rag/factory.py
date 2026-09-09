@@ -12,7 +12,12 @@ from .embedding import HashingEmbedder
 from .generation import DemoExtractiveGenerator
 from .indexing import Indexer
 from .models import IndexReport, RAGResponse
-from .ports import DocumentProcessor, Embedder, Reranker, SentenceSegmenter
+from .ports import (
+    DocumentProcessor,
+    Embedder,
+    Reranker,
+    SentenceSegmenter,
+)
 from .qasc import QASCConfig, QASCRetriever
 from .repository import (
     InMemoryRepositoryManifest,
@@ -88,8 +93,17 @@ def build_demo_rag(
     selected_embedder = (
         embedder if embedder is not None else HashingEmbedder(dimensions)
     )
-    transaction_coordinator = IndexTransactionCoordinator()
-    store = InMemoryVectorStore(transaction_coordinator=transaction_coordinator)
+    manifest_coordinator = getattr(
+        repository_manifest, "transaction_coordinator", None
+    )
+    transaction_coordinator = (
+        manifest_coordinator
+        if isinstance(manifest_coordinator, IndexTransactionCoordinator)
+        else IndexTransactionCoordinator()
+    )
+    store = InMemoryVectorStore(
+        transaction_coordinator=transaction_coordinator
+    )
     query_methods = {}
     document_indexes = ()
     if enable_qasc:
@@ -98,7 +112,12 @@ def build_demo_rag(
             if qasc_segmenter is not None
             else SpacySentenceSegmenter()
         )
-        qasc = QASCRetriever(segmenter, selected_embedder, config=qasc_config, transaction_coordinator=transaction_coordinator)
+        qasc = QASCRetriever(
+            segmenter,
+            selected_embedder,
+            config=qasc_config,
+            transaction_coordinator=transaction_coordinator,
+        )
         query_methods["qasc"] = qasc
         document_indexes = (qasc,)
     elif qasc_segmenter is not None or qasc_config is not None:
@@ -124,7 +143,9 @@ def build_demo_rag(
         manifest=(
             repository_manifest
             if repository_manifest is not None
-            else InMemoryRepositoryManifest()
+            else InMemoryRepositoryManifest(
+                transaction_coordinator=transaction_coordinator
+            )
         ),
         policy=repository_policy,
     )

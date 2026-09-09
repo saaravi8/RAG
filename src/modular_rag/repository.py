@@ -1,16 +1,21 @@
 """Safe, local-only repository discovery and indexing orchestration."""
 
 import hashlib
+import json
 import os
 import re
+import secrets
 import stat
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from threading import RLock
 from typing import (
     Any,
+    ContextManager,
     Dict,
     Iterable,
+    Iterator,
     List,
     Mapping,
     Optional,
@@ -32,7 +37,10 @@ from .errors import (
     RepositoryResourceLimitError,
     UnsafeRepositoryError,
 )
+from .fingerprint import IndexFingerprint, describe_component
 from .indexing import Indexer
+from .ports import CoordinatedPreparedDocumentReplacement
+from .transactions import IndexTransactionCoordinator
 
 
 _URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
@@ -161,12 +169,16 @@ class RepositoryLimits:
     max_chunks_per_file: int = 500
     max_total_chunks: int = 50_000
     max_errors: int = 100
+    max_discovered_entries: int = 100_000
+    max_issues: int = 1_000
     max_metadata_length: int = 512
     max_ignore_file_bytes: int = 131_072
 
     def __post_init__(self) -> None:
         for name, value in vars(self).items():
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError("{} must be an integer.".format(name))
+            if value <= 0:
                 raise ValueError("{} must be a positive integer.".format(name))
 
 
@@ -188,6 +200,72 @@ class RepositoryIssue:
     code: str
 
 
+class _BoundedDiagnostics:
+    """Keep issue details bounded while retaining truthful aggregate counts."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.skips: List[RepositoryIssue] = []
+        self.failures: List[RepositoryIssue] = []
+        self.skipped_count = 0
+        self.failed_count = 0
+        self._truncated = False
+        self._terminal_codes = set()
+
+    def add_skip(
+        self, relative_path: str, code: str, *, terminal: bool = False
+    ) -> None:
+        self.skipped_count += 1
+        self._store(self.skips, RepositoryIssue(relative_path, code), terminal=terminal)
+
+    def add_failure(self, relative_path: str, code: str) -> None:
+        self.failed_count += 1
+        self._store(self.failures, RepositoryIssue(relative_path, code))
+
+    def add_skipped_count(self, count: int) -> None:
+        self.skipped_count += count
+
+    def _store(
+        self,
+        target: List[RepositoryIssue],
+        issue: RepositoryIssue,
+        *,
+        terminal: bool = False,
+    ) -> None:
+        if len(self.skips) + len(self.failures) < self.limit:
+            target.append(issue)
+            if terminal:
+                self._terminal_codes.add(issue.code)
+            return
+        self._truncated = True
+        if terminal and issue.code not in self._terminal_codes:
+            self._replace_last(target, issue)
+            self._terminal_codes.add(issue.code)
+
+    def _replace_last(
+        self, target: List[RepositoryIssue], issue: RepositoryIssue
+    ) -> None:
+        if target:
+            target[-1] = issue
+        elif target is self.skips:
+            self.failures.pop()
+            self.skips.append(issue)
+        else:
+            self.skips.pop()
+            self.failures.append(issue)
+
+    def snapshots(
+        self,
+    ) -> Tuple[Tuple[RepositoryIssue, ...], Tuple[RepositoryIssue, ...]]:
+        if self._truncated and not self._terminal_codes:
+            marker = RepositoryIssue("", "diagnostics_truncated")
+            if len(self.skips) + len(self.failures) < self.limit:
+                self.skips.append(marker)
+            else:
+                self._replace_last(self.skips, marker)
+        return tuple(self.skips), tuple(self.failures)
+
+
 @dataclass(frozen=True)
 class RepositoryIndexReport:
     """Immutable summary of one repository snapshot ingestion."""
@@ -206,6 +284,7 @@ class RepositoryIndexReport:
     complete: bool
     skips: Tuple[RepositoryIssue, ...] = ()
     failures: Tuple[RepositoryIssue, ...] = ()
+    unchanged: int = 0
 
 
 @dataclass(frozen=True)
@@ -217,6 +296,97 @@ class RepositoryManifestEntry:
     document_id: str
     file_hash: str
     commit_sha: Optional[str]
+    index_fingerprint: str = ""
+    chunk_count: int = 0
+    document_state_token: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.chunk_count, int) or isinstance(
+            self.chunk_count, bool
+        ):
+            raise TypeError("chunk_count must be an integer.")
+        if self.chunk_count < 0:
+            raise ValueError("chunk_count must be a non-negative integer.")
+
+
+def _repository_document_id(repository_id: str, relative_path: str) -> str:
+    identity = "{}\x00{}".format(repository_id, relative_path)
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    return "repo_{}".format(digest)
+
+
+def _validate_manifest_snapshot(
+    repository_id: str,
+    entries: Mapping[str, RepositoryManifestEntry],
+    *,
+    allow_legacy_state_tokens: bool,
+    error_type: type = ValueError,
+) -> Dict[str, RepositoryManifestEntry]:
+    """Validate a manifest before it can influence reuse or stored state."""
+
+    def reject(message: str) -> None:
+        raise error_type(message)
+
+    if not isinstance(entries, Mapping):
+        reject("Repository manifest entries must be a mapping.")
+    if not isinstance(repository_id, str) or not _SAFE_REPOSITORY_ID.fullmatch(
+        repository_id
+    ):
+        reject("Repository manifest has an invalid repository ID.")
+
+    snapshot: Dict[str, RepositoryManifestEntry] = {}
+    for key, entry in entries.items():
+        if not isinstance(key, str) or not isinstance(entry, RepositoryManifestEntry):
+            reject("Repository manifest entries have invalid types.")
+        if key != entry.relative_path:
+            reject("Repository manifest keys must match entry relative paths.")
+        path = PurePosixPath(key)
+        if (
+            not key
+            or path.is_absolute()
+            or path.as_posix() != key
+            or "\\" in key
+            or _CONTROL_CHARACTERS.search(key)
+            or any(part in {"", ".", ".."} for part in path.parts)
+        ):
+            reject("Repository manifest contains an invalid relative path.")
+        if entry.repository_id != repository_id:
+            reject("Repository manifest entries must match the repository ID.")
+        if entry.document_id != _repository_document_id(repository_id, key):
+            reject("Repository manifest contains an invalid document ID.")
+        if not isinstance(entry.file_hash, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", entry.file_hash
+        ):
+            reject("Repository manifest contains an invalid file hash.")
+        legacy = allow_legacy_state_tokens and entry.document_state_token == ""
+        if not legacy and (
+            not isinstance(entry.document_state_token, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", entry.document_state_token)
+        ):
+            reject("Repository manifest contains an invalid document state token.")
+        if legacy:
+            if entry.index_fingerprint and not re.fullmatch(
+                r"[0-9a-f]{64}", entry.index_fingerprint
+            ):
+                reject("Repository manifest contains an invalid index fingerprint.")
+        elif not isinstance(entry.index_fingerprint, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", entry.index_fingerprint
+        ):
+            reject("Repository manifest contains an invalid index fingerprint.")
+        if entry.commit_sha is not None and (
+            not isinstance(entry.commit_sha, str)
+            or not re.fullmatch(r"[0-9a-f]{40,64}", entry.commit_sha)
+        ):
+            reject("Repository manifest contains an invalid commit SHA.")
+        minimum_chunks = 0 if legacy else 1
+        if (
+            not isinstance(entry.chunk_count, int)
+            or isinstance(entry.chunk_count, bool)
+            or entry.chunk_count < minimum_chunks
+        ):
+            reject("Repository manifest contains an invalid chunk count.")
+        snapshot[key] = entry
+    return snapshot
 
 
 class RepositoryManifest(Protocol):
@@ -236,19 +406,183 @@ class RepositoryManifest(Protocol):
 
         ...
 
+    def prepare_replace(
+        self,
+        repository_id: str,
+        entries: Mapping[str, RepositoryManifestEntry],
+    ) -> CoordinatedPreparedDocumentReplacement:
+        """Stage a complete manifest snapshot without exposing it."""
+
+        ...
+
+    def synchronized_scan(self, repository_id: str) -> ContextManager[None]:
+        """Lease one repository identity for the duration of a refresh."""
+
+        ...
+
+
+class _PreparedManifestReplacement:
+    def __init__(
+        self,
+        manifest: "InMemoryRepositoryManifest",
+        repository_id: str,
+        previous: Optional[Dict[str, RepositoryManifestEntry]],
+        candidate: Dict[str, RepositoryManifestEntry],
+        expected_generation: int,
+    ) -> None:
+        self._manifest = manifest
+        self._repository_id = repository_id
+        self._previous = previous
+        self._candidate = candidate
+        self._expected_generation = expected_generation
+        self._committed_generation: Optional[int] = None
+        self._committed = False
+        self._rolled_back = False
+
+    @property
+    def transaction_coordinator(self) -> IndexTransactionCoordinator:
+        return self._manifest.transaction_coordinator
+
+    def commit(self) -> None:
+        with self._manifest.transaction_coordinator.synchronized():
+            with self._manifest._lock:
+                if self._committed or self._rolled_back:
+                    return
+                if self._manifest._generation(self._repository_id) != (
+                    self._expected_generation
+                ):
+                    raise RepositoryIngestionError(
+                        "Prepared repository manifest replacement is stale."
+                    )
+                self._manifest._entries[self._repository_id] = self._candidate
+                self._committed_generation = self._manifest._advance_generation(
+                    self._repository_id
+                )
+                self._committed = True
+
+    def rollback(self) -> None:
+        with self._manifest.transaction_coordinator.synchronized():
+            with self._manifest._lock:
+                if self._rolled_back:
+                    return
+                if (
+                    self._committed
+                    and self._manifest._generation(self._repository_id)
+                    == self._committed_generation
+                ):
+                    if self._previous is None:
+                        self._manifest._entries.pop(self._repository_id, None)
+                    else:
+                        self._manifest._entries[self._repository_id] = self._previous
+                    self._manifest._advance_generation(self._repository_id)
+                self._rolled_back = True
+
+
+class _PreparedManifestEntryChange:
+    """Prevalidated in-place update for one default-manifest entry."""
+
+    def __init__(
+        self,
+        manifest: "InMemoryRepositoryManifest",
+        repository_id: str,
+        relative_path: str,
+        previous: Optional[RepositoryManifestEntry],
+        candidate: Optional[RepositoryManifestEntry],
+        expected_generation: int,
+    ) -> None:
+        self._manifest = manifest
+        self._repository_id = repository_id
+        self._relative_path = relative_path
+        self._previous = previous
+        self._candidate = candidate
+        self._expected_generation = expected_generation
+        self._committed_generation: Optional[int] = None
+        self._committed = False
+        self._rolled_back = False
+
+    @property
+    def transaction_coordinator(self) -> IndexTransactionCoordinator:
+        return self._manifest.transaction_coordinator
+
+    def commit(self) -> None:
+        with self._manifest.transaction_coordinator.synchronized():
+            with self._manifest._lock:
+                if self._committed or self._rolled_back:
+                    return
+                if self._manifest._generation(self._repository_id) != (
+                    self._expected_generation
+                ):
+                    raise RepositoryIngestionError(
+                        "Prepared repository manifest entry change is stale."
+                    )
+                entries = self._manifest._entries.setdefault(
+                    self._repository_id, {}
+                )
+                if self._candidate is None:
+                    entries.pop(self._relative_path, None)
+                else:
+                    entries[self._relative_path] = self._candidate
+                self._committed_generation = self._manifest._advance_generation(
+                    self._repository_id
+                )
+                self._committed = True
+
+    def rollback(self) -> None:
+        with self._manifest.transaction_coordinator.synchronized():
+            with self._manifest._lock:
+                if self._rolled_back:
+                    return
+                if (
+                    self._committed
+                    and self._manifest._generation(self._repository_id)
+                    == self._committed_generation
+                ):
+                    entries = self._manifest._entries.setdefault(
+                        self._repository_id, {}
+                    )
+                    if self._previous is None:
+                        entries.pop(self._relative_path, None)
+                    else:
+                        entries[self._relative_path] = self._previous
+                    self._manifest._advance_generation(self._repository_id)
+                self._rolled_back = True
+
 
 class InMemoryRepositoryManifest:
     """Thread-safe demo manifest; production applications should persist it."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        transaction_coordinator: Optional[IndexTransactionCoordinator] = None,
+    ) -> None:
         self._entries: Dict[str, Dict[str, RepositoryManifestEntry]] = {}
+        self._generations: Dict[str, int] = {}
+        self._scan_locks: Dict[str, RLock] = {}
         self._lock = RLock()
+        self.transaction_coordinator = (
+            transaction_coordinator
+            if transaction_coordinator is not None
+            else IndexTransactionCoordinator()
+        )
+
+    @contextmanager
+    def synchronized_scan(self, repository_id: str) -> Iterator[None]:
+        with self._lock:
+            scan_lock = self._scan_locks.setdefault(repository_id, RLock())
+        with scan_lock:
+            yield
 
     def entries(self, repository_id: str) -> Mapping[str, RepositoryManifestEntry]:
         """Return a copy of the current in-memory manifest."""
 
-        with self._lock:
-            return dict(self._entries.get(repository_id, {}))
+        with self.transaction_coordinator.synchronized():
+            with self._lock:
+                return _validate_manifest_snapshot(
+                    repository_id,
+                    self._entries.get(repository_id, {}),
+                    allow_legacy_state_tokens=True,
+                )
 
     def replace(
         self,
@@ -257,11 +591,110 @@ class InMemoryRepositoryManifest:
     ) -> None:
         """Replace one repository manifest after validating entry ownership."""
 
-        snapshot = dict(entries)
-        if any(entry.repository_id != repository_id for entry in snapshot.values()):
-            raise ValueError("Manifest entries must match the repository ID.")
-        with self._lock:
-            self._entries[repository_id] = snapshot
+        with self.transaction_coordinator.synchronized():
+            prepared = self.prepare_replace(repository_id, entries)
+            prepared.commit()
+
+    def prepare_replace(
+        self,
+        repository_id: str,
+        entries: Mapping[str, RepositoryManifestEntry],
+    ) -> "CoordinatedPreparedDocumentReplacement":
+        with self.transaction_coordinator.synchronized():
+            with self._lock:
+                snapshot = _validate_manifest_snapshot(
+                    repository_id,
+                    entries,
+                    allow_legacy_state_tokens=True,
+                )
+                previous_snapshot = _validate_manifest_snapshot(
+                    repository_id,
+                    self._entries.get(repository_id, {}),
+                    allow_legacy_state_tokens=True,
+                )
+                for path, entry in snapshot.items():
+                    if (
+                        not entry.document_state_token
+                        and previous_snapshot.get(path) != entry
+                    ):
+                        raise ValueError(
+                            "New manifest entries require a document state token."
+                        )
+                previous = self._entries.get(repository_id)
+                return _PreparedManifestReplacement(
+                    self,
+                    repository_id,
+                    previous,
+                    snapshot,
+                    self._generation(repository_id),
+                )
+
+    def prepare_replace_entry(
+        self,
+        repository_id: str,
+        relative_path: str,
+        entry: RepositoryManifestEntry,
+    ) -> "CoordinatedPreparedDocumentReplacement":
+        """Stage one validated entry without copying the repository manifest."""
+
+        with self.transaction_coordinator.synchronized():
+            with self._lock:
+                snapshot = _validate_manifest_snapshot(
+                    repository_id,
+                    {relative_path: entry},
+                    allow_legacy_state_tokens=True,
+                )
+                previous = self._entries.get(repository_id, {}).get(relative_path)
+                if not entry.document_state_token and previous != entry:
+                    raise ValueError(
+                        "New manifest entries require a document state token."
+                    )
+                return _PreparedManifestEntryChange(
+                    self,
+                    repository_id,
+                    relative_path,
+                    previous,
+                    snapshot[relative_path],
+                    self._generation(repository_id),
+                )
+
+    def prepare_delete_entry(
+        self,
+        repository_id: str,
+        relative_path: str,
+    ) -> "CoordinatedPreparedDocumentReplacement":
+        """Stage removal of one entry without copying the repository manifest."""
+
+        with self.transaction_coordinator.synchronized():
+            with self._lock:
+                _validate_manifest_snapshot(
+                    repository_id,
+                    {},
+                    allow_legacy_state_tokens=True,
+                )
+                previous = self._entries.get(repository_id, {}).get(relative_path)
+                if previous is not None:
+                    _validate_manifest_snapshot(
+                        repository_id,
+                        {relative_path: previous},
+                        allow_legacy_state_tokens=True,
+                    )
+                return _PreparedManifestEntryChange(
+                    self,
+                    repository_id,
+                    relative_path,
+                    previous,
+                    None,
+                    self._generation(repository_id),
+                )
+
+    def _generation(self, repository_id: str) -> int:
+        return self._generations.get(repository_id, 0)
+
+    def _advance_generation(self, repository_id: str) -> int:
+        generation = self._generation(repository_id) + 1
+        self._generations[repository_id] = generation
+        return generation
 
 
 @dataclass(frozen=True)
@@ -320,6 +753,19 @@ class DefaultSecretScanner:
         r"\b([A-Za-z][A-Za-z0-9+.-]{1,20}://)"
         r"[^\s/:@]{1,128}:[^\s/@]{1,256}@"
     )
+
+    def fingerprint_components(self):
+        return {
+            "algorithm": "bounded-high-confidence-secret-screening",
+            "algorithm_version": 1,
+            "secret_filenames": tuple(sorted(self._SECRET_FILENAMES)),
+            "secret_suffixes": self._SECRET_SUFFIXES,
+            "safe_env_suffixes": self._SAFE_ENV_SUFFIXES,
+            "assignment_pattern": self._ASSIGNMENT.pattern,
+            "aws_key_pattern": self._AWS_KEY.pattern,
+            "private_key_pattern": self._PRIVATE_KEY.pattern,
+            "credential_url_pattern": self._CREDENTIAL_URL.pattern,
+        }
 
     def rejects_path(self, relative_path: str) -> bool:
         """Reject conventional credential names and sensitive directories."""
@@ -388,7 +834,6 @@ class _Candidate:
 @dataclass(frozen=True)
 class _DiscoveryResult:
     candidates: Tuple[_Candidate, ...]
-    issues: Tuple[RepositoryIssue, ...]
     discovered: int
     complete: bool
 
@@ -588,12 +1033,18 @@ class _IgnoreRules:
 
 
 class _RepositoryDiscovery:
-    def __init__(self, repository: _SafeRepository, policy: RepositoryPolicy) -> None:
+    def __init__(
+        self,
+        repository: _SafeRepository,
+        policy: RepositoryPolicy,
+        diagnostics: _BoundedDiagnostics,
+    ) -> None:
         self.repository = repository
         self.policy = policy
+        self.diagnostics = diagnostics
         self.rules = _IgnoreRules()
         self.candidates: List[_Candidate] = []
-        self.issues: List[RepositoryIssue] = []
+        self.visited_entries = 0
         self.discovered = 0
         self.complete = True
 
@@ -601,7 +1052,6 @@ class _RepositoryDiscovery:
         self._walk("", 0)
         return _DiscoveryResult(
             tuple(self.candidates),
-            tuple(self.issues),
             self.discovered,
             self.complete,
         )
@@ -610,7 +1060,10 @@ class _RepositoryDiscovery:
         if not self.complete:
             return
         if depth > self.policy.limits.max_depth:
-            self.issues.append(RepositoryIssue(relative_directory, "maximum_depth"))
+            self.complete = False
+            self.diagnostics.add_skip(
+                relative_directory, "maximum_depth", terminal=True
+            )
             return
 
         absolute = (
@@ -618,37 +1071,29 @@ class _RepositoryDiscovery:
             if not relative_directory
             else self.repository.absolute(relative_directory)
         )
-        try:
-            entries = sorted(os.scandir(absolute), key=lambda item: item.name)
-        except OSError:
-            if relative_directory:
-                self.issues.append(
-                    RepositoryIssue(relative_directory, "directory_unreadable")
-                )
+        if not self._load_ignore_rules(relative_directory):
             return
 
-        ignore_entry = next(
-            (entry for entry in entries if entry.name == ".gitignore"), None
-        )
-        if ignore_entry is not None and not ignore_entry.is_symlink():
-            try:
-                info = ignore_entry.stat(follow_symlinks=False)
-                if stat.S_ISREG(info.st_mode):
-                    relative_ignore = self._join(relative_directory, ".gitignore")
-                    raw = self.repository.read_bytes(
-                        relative_ignore, self.policy.limits.max_ignore_file_bytes
-                    )
-                    self.rules.add(
-                        relative_directory,
-                        raw.decode("utf-8-sig", errors="replace").splitlines(),
-                    )
-            except RepositoryIngestionError:
-                self.issues.append(
-                    RepositoryIssue(
-                        self._join(relative_directory, ".gitignore"),
-                        "gitignore_unreadable",
-                    )
-                )
+        entries = []
+        hit_entry_limit = False
+        try:
+            with os.scandir(absolute) as iterator:
+                for entry in iterator:
+                    if (
+                        self.visited_entries
+                        >= self.policy.limits.max_discovered_entries
+                    ):
+                        hit_entry_limit = True
+                        break
+                    self.visited_entries += 1
+                    entries.append(entry)
+            entries.sort(key=lambda item: item.name)
+        except OSError:
+            self.complete = False
+            self.diagnostics.add_skip(
+                relative_directory, "directory_unreadable"
+            )
+            return
 
         for entry in entries:
             if not self.complete:
@@ -657,10 +1102,11 @@ class _RepositoryDiscovery:
             try:
                 info = entry.stat(follow_symlinks=False)
             except OSError:
-                self.issues.append(RepositoryIssue(relative, "entry_unreadable"))
+                self.complete = False
+                self.diagnostics.add_skip(relative, "entry_unreadable")
                 continue
-            if entry.is_symlink():
-                self.issues.append(RepositoryIssue(relative, "symlink"))
+            if stat.S_ISLNK(info.st_mode):
+                self.diagnostics.add_skip(relative, "symlink")
                 continue
             if stat.S_ISDIR(info.st_mode):
                 lowered = entry.name.lower()
@@ -669,23 +1115,56 @@ class _RepositoryDiscovery:
                 if self.rules.ignored(relative, directory=True):
                     continue
                 if self._contains_git_marker(relative):
-                    self.issues.append(RepositoryIssue(relative, "nested_repository"))
+                    self.diagnostics.add_skip(relative, "nested_repository")
                     continue
                 self._walk(relative, depth + 1)
                 continue
             if not stat.S_ISREG(info.st_mode):
-                self.issues.append(RepositoryIssue(relative, "special_file"))
+                self.diagnostics.add_skip(relative, "special_file")
                 continue
 
             self.discovered += 1
             if self.rules.ignored(relative):
-                self.issues.append(RepositoryIssue(relative, "gitignored"))
+                self.diagnostics.add_skip(relative, "gitignored")
                 continue
             if len(self.candidates) >= self.policy.limits.max_files:
                 self.complete = False
-                self.issues.append(RepositoryIssue(relative, "maximum_files"))
+                self.diagnostics.add_skip(relative, "maximum_files", terminal=True)
                 break
             self.candidates.append(_Candidate(relative, int(info.st_size)))
+
+        if self.complete and hit_entry_limit:
+            self.complete = False
+            self.diagnostics.add_skip(
+                relative_directory, "maximum_discovered_entries", terminal=True
+            )
+
+    def _load_ignore_rules(self, relative_directory: str) -> bool:
+        relative_ignore = self._join(relative_directory, ".gitignore")
+        target = self.repository.absolute(relative_ignore)
+        try:
+            info = target.lstat()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            self.complete = False
+            self.diagnostics.add_skip(relative_ignore, "gitignore_unreadable")
+            return False
+        if not stat.S_ISREG(info.st_mode):
+            return True
+        try:
+            raw = self.repository.read_bytes(
+                relative_ignore, self.policy.limits.max_ignore_file_bytes
+            )
+        except (OSError, RepositoryIngestionError):
+            self.complete = False
+            self.diagnostics.add_skip(relative_ignore, "gitignore_unreadable")
+            return False
+        self.rules.add(
+            relative_directory,
+            raw.decode("utf-8-sig", errors="replace").splitlines(),
+        )
+        return True
 
     def _contains_git_marker(self, relative_directory: str) -> bool:
         marker = self.repository.absolute(relative_directory) / ".git"
@@ -712,15 +1191,75 @@ class RepositoryIndexer:
         secret_scanner: Optional[SecretScanner] = None,
     ) -> None:
         self.indexer = indexer
+        index_coordinator = getattr(indexer, "transaction_coordinator", None)
         self.manifest = (
-            manifest if manifest is not None else InMemoryRepositoryManifest()
+            manifest
+            if manifest is not None
+            else InMemoryRepositoryManifest(
+                transaction_coordinator=(
+                    index_coordinator
+                    if isinstance(index_coordinator, IndexTransactionCoordinator)
+                    else None
+                )
+            )
         )
         self.policy = policy if policy is not None else RepositoryPolicy()
         self.secret_scanner = (
             secret_scanner if secret_scanner is not None else DefaultSecretScanner()
         )
+        if not callable(getattr(self.manifest, "prepare_replace", None)):
+            raise RepositoryIngestionError(
+                "Repository manifests must support staged replacement."
+            )
+        if not callable(getattr(self.manifest, "synchronized_scan", None)):
+            raise RepositoryIngestionError(
+                "Repository manifests must provide a synchronized scan lease."
+            )
+        store = getattr(self.indexer, "store", None)
+        if store is not None:
+            missing = tuple(
+                operation
+                for operation in (
+                    "prepare_replace_document",
+                    "prepare_delete_document",
+                )
+                if not callable(getattr(store, operation, None))
+            )
+            if missing:
+                raise RepositoryIngestionError(
+                    "Repository indexing requires staged replacement and deletion "
+                    "on the primary vector store; missing: {}.".format(
+                        ", ".join(missing)
+                    )
+                )
+        manifest_coordinator = getattr(
+            self.manifest, "transaction_coordinator", None
+        )
+        if (
+            isinstance(index_coordinator, IndexTransactionCoordinator)
+            and manifest_coordinator is not index_coordinator
+        ):
+            raise RepositoryIngestionError(
+                "The indexer and in-process repository manifest must share one "
+                "IndexTransactionCoordinator."
+            )
 
     def index_repository(
+        self,
+        source: Union[str, Path],
+        *,
+        repository_id: str,
+        policy: Optional[RepositoryPolicy] = None,
+    ) -> RepositoryIndexReport:
+        repository_id = self._repository_id(repository_id)
+        with self.manifest.synchronized_scan(repository_id):
+            return self._index_repository_locked(
+                source,
+                repository_id=repository_id,
+                policy=policy,
+            )
+
+    def _index_repository_locked(
         self,
         source: Union[str, Path],
         *,
@@ -745,80 +1284,136 @@ class RepositoryIndexer:
             previously indexed entries that were not safely observed.
         """
 
-        repository_id = self._repository_id(repository_id)
         selected = policy or self.policy
         repository = _SafeRepository(source)
         commit_sha = repository.commit_sha()
-        discovery = _RepositoryDiscovery(repository, selected).discover()
-        previous = dict(self.manifest.entries(repository_id))
-        successful: Dict[str, RepositoryManifestEntry] = {}
+        diagnostics = _BoundedDiagnostics(selected.limits.max_issues)
+        discovery = _RepositoryDiscovery(
+            repository, selected, diagnostics
+        ).discover()
+        try:
+            previous = _validate_manifest_snapshot(
+                repository_id,
+                self.manifest.entries(repository_id),
+                allow_legacy_state_tokens=True,
+                error_type=RepositoryIngestionError,
+            )
+        except RepositoryIngestionError:
+            raise
+        except Exception as exc:
+            raise RepositoryIngestionError(
+                "Repository manifest snapshot could not be validated."
+            ) from exc
+        fingerprint = self._repository_fingerprint(selected)
+        current_manifest = dict(previous)
+        retained: Dict[str, RepositoryManifestEntry] = {}
         failed_paths = set()
-        skips = list(discovery.issues)
-        failures: List[RepositoryIssue] = []
-        indexed = redacted = chunk_count = secret_count = 0
+        indexed = unchanged = redacted = chunk_count = secret_count = 0
         total_bytes = total_chunks = 0
         complete = discovery.complete
 
         for position, candidate in enumerate(discovery.candidates):
-            if len(failures) >= selected.limits.max_errors:
+            if diagnostics.failed_count >= selected.limits.max_errors:
                 complete = False
-                for remaining in discovery.candidates[position:]:
-                    skips.append(
-                        RepositoryIssue(remaining.relative_path, "maximum_errors")
-                    )
+                diagnostics.add_skipped_count(
+                    len(discovery.candidates) - position - 1
+                )
+                diagnostics.add_skip(
+                    candidate.relative_path, "maximum_errors", terminal=True
+                )
                 break
 
             relative = candidate.relative_path
             classification = self._classify(relative, selected)
             if classification is None:
-                skips.append(RepositoryIssue(relative, "unsupported_type"))
+                diagnostics.add_skip(relative, "unsupported_type")
                 continue
             if self.secret_scanner.rejects_path(relative):
-                skips.append(RepositoryIssue(relative, "sensitive_path"))
+                diagnostics.add_skip(relative, "sensitive_path")
                 continue
             if candidate.size > selected.limits.max_file_bytes:
-                skips.append(RepositoryIssue(relative, "file_too_large"))
+                diagnostics.add_skip(relative, "file_too_large")
+                continue
+            if len(relative) > selected.limits.max_metadata_length:
+                diagnostics.add_skip(relative, "metadata_limit")
                 continue
             if total_bytes + candidate.size > selected.limits.max_total_bytes:
                 complete = False
-                for remaining in discovery.candidates[position:]:
-                    skips.append(
-                        RepositoryIssue(remaining.relative_path, "total_bytes_limit")
-                    )
+                diagnostics.add_skipped_count(len(discovery.candidates) - position - 1)
+                diagnostics.add_skip(
+                    relative, "total_bytes_limit", terminal=True
+                )
                 break
 
             try:
                 raw = repository.read_bytes(relative, selected.limits.max_file_bytes)
                 if total_bytes + len(raw) > selected.limits.max_total_bytes:
                     complete = False
-                    for remaining in discovery.candidates[position:]:
-                        skips.append(
-                            RepositoryIssue(
-                                remaining.relative_path, "total_bytes_limit"
-                            )
-                        )
+                    diagnostics.add_skipped_count(
+                        len(discovery.candidates) - position - 1
+                    )
+                    diagnostics.add_skip(
+                        relative, "total_bytes_limit", terminal=True
+                    )
                     break
                 total_bytes += len(raw)
+                file_hash = hashlib.sha256(raw).hexdigest()
+                previous_entry = previous.get(relative)
+                if (
+                    fingerprint.reusable
+                    and previous_entry is not None
+                    and previous_entry.file_hash == file_hash
+                    and previous_entry.index_fingerprint == fingerprint.digest
+                    and previous_entry.commit_sha == commit_sha
+                    and previous_entry.chunk_count > 0
+                    and previous_entry.chunk_count
+                    <= selected.limits.max_chunks_per_file
+                    and previous_entry.document_state_token
+                    and self._document_state_matches(
+                        previous_entry.document_id,
+                        previous_entry.document_state_token,
+                    )
+                ):
+                    if self._binary(raw):
+                        diagnostics.add_skip(relative, "binary")
+                        continue
+                    text, _ = self._decode(raw)
+                    if text.count("\n") + 1 > selected.limits.max_lines_per_file:
+                        diagnostics.add_skip(relative, "line_limit")
+                        continue
+                    if total_chunks + previous_entry.chunk_count > (
+                        selected.limits.max_total_chunks
+                    ):
+                        complete = False
+                        diagnostics.add_skip(
+                            relative, "total_chunks_limit", terminal=True
+                        )
+                        break
+                    total_chunks += previous_entry.chunk_count
+                    current_manifest[relative] = previous_entry
+                    retained[relative] = previous_entry
+                    unchanged += 1
+                    continue
                 if self._binary(raw):
-                    skips.append(RepositoryIssue(relative, "binary"))
+                    diagnostics.add_skip(relative, "binary")
                     continue
                 text, encoding = self._decode(raw)
                 if text.count("\n") + 1 > selected.limits.max_lines_per_file:
-                    skips.append(RepositoryIssue(relative, "line_limit"))
+                    diagnostics.add_skip(relative, "line_limit")
                     continue
                 if not selected.include_generated and self._generated(relative, text):
-                    skips.append(RepositoryIssue(relative, "generated"))
+                    diagnostics.add_skip(relative, "generated")
                     continue
                 secret_result = self.secret_scanner.scan(text)
                 if not isinstance(secret_result, SecretScanResult):
                     raise TypeError("Secret scanner returned an invalid result.")
                 if not secret_result.text.strip():
-                    skips.append(RepositoryIssue(relative, "empty"))
+                    diagnostics.add_skip(relative, "empty")
                     continue
 
                 injection_suspected = bool(_PROMPT_INJECTION.search(secret_result.text))
-                file_hash = hashlib.sha256(raw).hexdigest()
                 document_id = self._document_id(repository_id, relative)
+                document_state_token = secrets.token_hex(32)
                 metadata = self._metadata(
                     repository_id=repository_id,
                     commit_sha=commit_sha,
@@ -826,6 +1421,8 @@ class RepositoryIndexer:
                     classification=classification,
                     document_id=document_id,
                     file_hash=file_hash,
+                    index_fingerprint=fingerprint.digest,
+                    document_state_token=document_state_token,
                     encoding=encoding,
                     redactions=secret_result.redaction_count,
                     injection_suspected=injection_suspected,
@@ -837,97 +1434,246 @@ class RepositoryIndexer:
                 remaining_chunks = selected.limits.max_total_chunks - total_chunks
                 if remaining_chunks <= 0:
                     complete = False
-                    skips.append(RepositoryIssue(relative, "total_chunks_limit"))
+                    diagnostics.add_skip(
+                        relative, "total_chunks_limit", terminal=True
+                    )
                     break
+                def prepare_manifest(
+                    index_report,
+                    selected_path=relative,
+                    selected_document_id=document_id,
+                    selected_file_hash=file_hash,
+                    selected_state_token=document_state_token,
+                ):
+                    entry = RepositoryManifestEntry(
+                        repository_id=repository_id,
+                        relative_path=selected_path,
+                        document_id=selected_document_id,
+                        file_hash=selected_file_hash,
+                        commit_sha=commit_sha,
+                        index_fingerprint=fingerprint.digest,
+                        chunk_count=index_report.chunk_count,
+                        document_state_token=selected_state_token,
+                    )
+                    return self._prepare_manifest_entry(
+                        repository_id,
+                        selected_path,
+                        entry,
+                        current_manifest,
+                    )
+
                 report = self.indexer.index_document(
                     document,
                     max_chunks=min(
                         selected.limits.max_chunks_per_file, remaining_chunks
                     ),
+                    required_chunk_metadata=metadata,
+                    report_preparations=(prepare_manifest,),
                 )
+                manifest_entry = RepositoryManifestEntry(
+                    repository_id=repository_id,
+                    relative_path=relative,
+                    document_id=document_id,
+                    file_hash=file_hash,
+                    commit_sha=commit_sha,
+                    index_fingerprint=fingerprint.digest,
+                    chunk_count=report.chunk_count,
+                    document_state_token=document_state_token,
+                )
+                current_manifest[relative] = manifest_entry
                 total_chunks += report.chunk_count
                 chunk_count += report.chunk_count
                 indexed += 1
                 if secret_result.redaction_count:
                     redacted += 1
                     secret_count += secret_result.redaction_count
-                successful[relative] = RepositoryManifestEntry(
-                    repository_id,
-                    relative,
-                    document_id,
-                    file_hash,
-                    commit_sha,
-                )
+                retained[relative] = manifest_entry
             except RepositoryResourceLimitError:
-                skips.append(RepositoryIssue(relative, "chunk_limit"))
+                diagnostics.add_skip(relative, "chunk_limit")
             except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception as exc:
                 del exc
                 failed_paths.add(relative)
-                failures.append(RepositoryIssue(relative, "processing_failed"))
+                diagnostics.add_failure(relative, "processing_failed")
 
         current_manifest = self._finish_manifest(
             repository_id,
             previous,
-            successful,
+            current_manifest,
+            retained,
             failed_paths,
             complete,
-            failures,
+            diagnostics,
         )
         deleted = sum(
             1
             for path in previous
             if path not in current_manifest and path not in failed_paths
         )
+        skips, failures = diagnostics.snapshots()
         return RepositoryIndexReport(
             repository_id=repository_id,
             commit_sha=commit_sha,
             snapshot_kind="working_tree",
             discovered=discovery.discovered,
             indexed=indexed,
-            skipped=len(skips),
+            skipped=diagnostics.skipped_count,
             redacted=redacted,
-            failed=len(failures),
+            failed=diagnostics.failed_count,
             deleted=deleted,
             chunk_count=chunk_count,
             secret_redaction_count=secret_count,
             complete=complete,
             skips=tuple(skips),
             failures=tuple(failures),
+            unchanged=unchanged,
         )
 
     def _finish_manifest(
         self,
         repository_id: str,
         previous: Mapping[str, RepositoryManifestEntry],
-        successful: Mapping[str, RepositoryManifestEntry],
+        current_manifest: Mapping[str, RepositoryManifestEntry],
+        retained: Mapping[str, RepositoryManifestEntry],
         failed_paths: set,
         complete: bool,
-        failures: List[RepositoryIssue],
+        diagnostics: _BoundedDiagnostics,
     ) -> Mapping[str, RepositoryManifestEntry]:
-        desired: Dict[str, RepositoryManifestEntry]
+        desired = dict(current_manifest)
         if complete:
-            desired = {
-                path: entry for path, entry in previous.items() if path in failed_paths
-            }
-        else:
-            desired = dict(previous)
-        desired.update(successful)
-
-        if complete:
-            stale = sorted(path for path in previous if path not in desired)
+            stale = sorted(
+                path
+                for path in previous
+                if path not in retained and path not in failed_paths
+            )
             for path in stale:
                 try:
-                    self.indexer.delete(previous[path].document_id)
+                    self.indexer.delete(
+                        previous[path].document_id,
+                        additional_preparations=(
+                            lambda selected_path=path: self._prepare_manifest_delete(
+                                repository_id,
+                                selected_path,
+                                desired,
+                            ),
+                        ),
+                    )
+                    desired.pop(path, None)
                 except (KeyboardInterrupt, SystemExit):
                     raise
                 except Exception as exc:
                     del exc
-                    desired[path] = previous[path]
-                    failures.append(RepositoryIssue(path, "stale_delete_failed"))
-        self.manifest.replace(repository_id, desired)
+                    diagnostics.add_failure(path, "stale_delete_failed")
         return desired
+
+    def _prepare_manifest_snapshot(
+        self,
+        repository_id: str,
+        entries: Mapping[str, RepositoryManifestEntry],
+    ) -> CoordinatedPreparedDocumentReplacement:
+        snapshot = _validate_manifest_snapshot(
+            repository_id,
+            entries,
+            allow_legacy_state_tokens=True,
+            error_type=RepositoryIngestionError,
+        )
+        return self.manifest.prepare_replace(repository_id, snapshot)
+
+    def _prepare_manifest_entry(
+        self,
+        repository_id: str,
+        relative_path: str,
+        entry: RepositoryManifestEntry,
+        current: Mapping[str, RepositoryManifestEntry],
+    ) -> CoordinatedPreparedDocumentReplacement:
+        if type(self.manifest) is InMemoryRepositoryManifest:
+            return self.manifest.prepare_replace_entry(
+                repository_id, relative_path, entry
+            )
+        snapshot = dict(current)
+        snapshot[relative_path] = entry
+        return self._prepare_manifest_snapshot(repository_id, snapshot)
+
+    def _prepare_manifest_delete(
+        self,
+        repository_id: str,
+        relative_path: str,
+        current: Mapping[str, RepositoryManifestEntry],
+    ) -> CoordinatedPreparedDocumentReplacement:
+        if type(self.manifest) is InMemoryRepositoryManifest:
+            return self.manifest.prepare_delete_entry(repository_id, relative_path)
+        snapshot = dict(current)
+        snapshot.pop(relative_path, None)
+        return self._prepare_manifest_snapshot(repository_id, snapshot)
+
+    def _document_state_matches(self, document_id: str, expected_token: str) -> bool:
+        """Require every physical index participant to own the manifest state.
+
+        The random token guards against accidental direct replacement or deletion;
+        it is not intended to authenticate a deliberately spoofing trusted writer.
+        """
+
+        store = getattr(self.indexer, "store", None)
+        document_indexes = getattr(self.indexer, "document_indexes", ())
+        participants = (store,) + tuple(document_indexes)
+        if store is None:
+            return False
+        coordinator = getattr(self.indexer, "transaction_coordinator", None)
+        if not isinstance(coordinator, IndexTransactionCoordinator):
+            return False
+        with coordinator.synchronized():
+            for participant in participants:
+                read_token = getattr(participant, "document_state_token", None)
+                if not callable(read_token):
+                    return False
+                try:
+                    if read_token(document_id) != expected_token:
+                        return False
+                except Exception:
+                    return False
+        return True
+
+    def _repository_fingerprint(
+        self, policy: RepositoryPolicy
+    ) -> IndexFingerprint:
+        candidate = getattr(self.indexer, "index_fingerprint", None)
+        if isinstance(candidate, IndexFingerprint):
+            index_components = candidate.components
+            index_reusable = candidate.reusable
+        else:
+            index_components = {
+                "type": "{}.{}".format(
+                    type(self.indexer).__module__, type(self.indexer).__qualname__
+                ),
+                "opaque": True,
+            }
+            index_reusable = False
+        scanner, scanner_reusable = describe_component(self.secret_scanner)
+        state_identity = getattr(self.indexer, "index_state_identity", None)
+        state_reusable = isinstance(state_identity, tuple) and bool(state_identity)
+        payload = {
+            "repository_schema_version": 2,
+            "index": index_components,
+            "index_state": state_identity,
+            "policy": {
+                "include_generated": policy.include_generated,
+                "include_lockfiles": policy.include_lockfiles,
+                "include_unknown_text": policy.include_unknown_text,
+            },
+            "secret_scanner": scanner,
+        }
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return IndexFingerprint(
+            hashlib.sha256(canonical).hexdigest(),
+            index_reusable and scanner_reusable and state_reusable,
+            payload,
+        )
 
     def _document(
         self,
@@ -937,13 +1683,20 @@ class RepositoryIndexer:
         metadata: Mapping[str, Any],
     ) -> Document:
         if classification.content_kind == "document":
-            return self.indexer.processor.process(
+            processed = self.indexer.processor.process(
                 DocumentSource.from_bytes(
                     text.encode("utf-8"),
                     name=relative_path,
                     document_type=classification.document_type,
                     metadata=metadata,
                 )
+            )
+            canonical_metadata = dict(processed.metadata)
+            canonical_metadata.update(metadata)
+            return Document(
+                processed.text,
+                classification.document_type,
+                canonical_metadata,
             )
         return Document(text, classification.document_type, metadata)
 
@@ -1027,6 +1780,8 @@ class RepositoryIndexer:
         classification: _Classification,
         document_id: str,
         file_hash: str,
+        index_fingerprint: str,
+        document_state_token: str,
         encoding: str,
         redactions: int,
         injection_suspected: bool,
@@ -1051,7 +1806,9 @@ class RepositoryIndexer:
             "language": classification.language,
             "content_kind": classification.content_kind,
             "file_hash": file_hash,
+            "index_fingerprint": index_fingerprint,
             "document_id": document_id,
+            "document_state_token": document_state_token,
             "encoding": encoding,
             "is_test": any(
                 part in {"test", "tests", "spec", "specs", "__tests__"}
@@ -1080,6 +1837,4 @@ class RepositoryIndexer:
 
     @staticmethod
     def _document_id(repository_id: str, relative_path: str) -> str:
-        identity = "{}\x00{}".format(repository_id, relative_path)
-        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
-        return "repo_{}".format(digest)
+        return _repository_document_id(repository_id, relative_path)
