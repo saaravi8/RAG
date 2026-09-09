@@ -1,12 +1,22 @@
 """Embedding adapters for local demos and semantic retrieval."""
 
 import hashlib
+import importlib.metadata
 import math
+import os
 import re
 from typing import Any, List, Optional, Sequence
 
 from .errors import ComponentContractError, OptionalDependencyError
 from .models import Vector
+
+
+def _positive_int(value: Any, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError("{} must be a positive integer.".format(name))
+    if value <= 0:
+        raise ValueError("{} must be a positive integer.".format(name))
+    return value
 
 
 class HashingEmbedder:
@@ -15,15 +25,21 @@ class HashingEmbedder:
     _TOKEN = re.compile(r"\w+", re.UNICODE)
 
     def __init__(self, dimensions: int = 256) -> None:
-        if dimensions <= 0:
-            raise ValueError("dimensions must be positive.")
-        self.dimensions = dimensions
+        self.dimensions = _positive_int(dimensions, "dimensions")
 
     def embed_documents(self, texts: Sequence[str]) -> Sequence[Vector]:
         return tuple(self._embed(text) for text in texts)
 
     def embed_query(self, text: str) -> Vector:
         return self._embed(text)
+
+    def fingerprint_components(self):
+        return {
+            "algorithm": "blake2b-feature-hashing",
+            "algorithm_version": 1,
+            "dimensions": self.dimensions,
+            "normalization": "l2",
+        }
 
     def _embed(self, text: str) -> Vector:
         values: List[float] = [0.0] * self.dimensions
@@ -78,10 +94,13 @@ class SentenceTransformerEmbedder:
             or not isinstance(document_prefix, str)
         ):
             raise TypeError("query_prefix and document_prefix must be strings.")
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive.")
-        if max_seq_length is not None and max_seq_length <= 0:
-            raise ValueError("max_seq_length must be positive when supplied.")
+        if revision is not None and not isinstance(revision, str):
+            raise TypeError("revision must be a string when supplied.")
+        if revision is not None and not revision.strip():
+            raise ValueError("revision cannot be empty when supplied.")
+        batch_size = _positive_int(batch_size, "batch_size")
+        if max_seq_length is not None:
+            max_seq_length = _positive_int(max_seq_length, "max_seq_length")
 
         self.model_name = model_name
         self.batch_size = batch_size
@@ -93,6 +112,7 @@ class SentenceTransformerEmbedder:
         self.revision = revision
         self.cache_folder = cache_folder
         self.local_files_only = local_files_only
+        self._injected_model = model is not None
         self._model = model if model is not None else self._load_model()
 
         if not callable(getattr(self._model, "encode", None)):
@@ -135,6 +155,32 @@ class SentenceTransformerEmbedder:
         vectors = self._encode([self.query_prefix + text])
         return vectors[0]
 
+    def fingerprint_components(self):
+        pinned_revision = bool(
+            self.revision and re.fullmatch(r"[0-9a-fA-F]{40,64}", self.revision)
+        )
+        local_model_path = os.path.exists(os.path.expanduser(self.model_name))
+        try:
+            provider_version = importlib.metadata.version("sentence-transformers")
+        except importlib.metadata.PackageNotFoundError:
+            provider_version = "unknown"
+        return {
+            "model_name": self.model_name,
+            "revision": self.revision,
+            "provider_version": provider_version,
+            "query_prefix": self.query_prefix,
+            "document_prefix": self.document_prefix,
+            "normalize_embeddings": self.normalize_embeddings,
+            "dimensions": self.dimensions,
+            "max_seq_length": getattr(self._model, "max_seq_length", None),
+            "injected_model": self._injected_model,
+            "local_model_path": local_model_path,
+            "revision_is_immutable": pinned_revision,
+            "opaque": (
+                self._injected_model or local_model_path or not pinned_revision
+            ),
+        }
+
     def _load_model(self) -> Any:
         try:
             from sentence_transformers import SentenceTransformer
@@ -160,27 +206,61 @@ class SentenceTransformerEmbedder:
             convert_to_numpy=True,
         )
         raw_vectors = encoded.tolist() if hasattr(encoded, "tolist") else encoded
-        try:
-            vectors = tuple(
-                tuple(float(value) for value in vector) for vector in raw_vectors
+        if isinstance(raw_vectors, (str, bytes, bytearray)):
+            raise ComponentContractError(
+                "Sentence Transformers returned malformed embeddings."
             )
-        except (TypeError, ValueError) as exc:
+        try:
+            rows = tuple(raw_vectors)
+        except TypeError as exc:
             raise ComponentContractError(
                 "Sentence Transformers returned malformed embeddings."
             ) from exc
-        if len(vectors) != len(texts) or any(not vector for vector in vectors):
+        vectors = []
+        for row in rows:
+            if isinstance(row, (str, bytes, bytearray)):
+                raise ComponentContractError(
+                    "Sentence Transformers returned malformed embeddings."
+                )
+            try:
+                coordinates = tuple(row)
+            except TypeError as exc:
+                raise ComponentContractError(
+                    "Sentence Transformers returned malformed embeddings."
+                ) from exc
+            vector = []
+            for value in coordinates:
+                if isinstance(value, (bool, str, bytes, bytearray)):
+                    raise ComponentContractError(
+                        "Sentence Transformers returned malformed embeddings."
+                    )
+                try:
+                    vector.append(float(value))
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ComponentContractError(
+                        "Sentence Transformers returned malformed embeddings."
+                    ) from exc
+            vectors.append(tuple(vector))
+        normalized_vectors = tuple(vectors)
+        if len(normalized_vectors) != len(texts) or any(
+            not vector for vector in normalized_vectors
+        ):
             raise ComponentContractError(
                 "Sentence Transformers returned {} vectors for {} texts.".format(
-                    len(vectors), len(texts)
+                    len(normalized_vectors), len(texts)
                 )
             )
-        dimensions = {len(vector) for vector in vectors}
+        dimensions = {len(vector) for vector in normalized_vectors}
         if len(dimensions) != 1:
             raise ComponentContractError(
                 "Sentence Transformers returned mixed vector dimensions."
             )
-        if any(not math.isfinite(value) for vector in vectors for value in vector):
+        if any(
+            not math.isfinite(value)
+            for vector in normalized_vectors
+            for value in vector
+        ):
             raise ComponentContractError(
                 "Sentence Transformers returned non-finite embedding values."
             )
-        return vectors
+        return normalized_vectors

@@ -220,7 +220,15 @@ class EmbedderContractTests(unittest.TestCase):
 
         for dimensions in (0, -1):
             with self.subTest(dimensions=dimensions):
-                with self.assertRaisesRegex(ValueError, "dimensions must be positive"):
+                with self.assertRaisesRegex(ValueError, "dimensions"):
+                    HashingEmbedder(dimensions)
+
+    def test_hashing_embedder_rejects_non_integer_dimensions(self):
+        """Boolean and fractional dimensions cannot define a vector shape."""
+
+        for dimensions in (True, 8.0):
+            with self.subTest(dimensions=dimensions):
+                with self.assertRaisesRegex(TypeError, "dimensions"):
                     HashingEmbedder(dimensions)
 
 

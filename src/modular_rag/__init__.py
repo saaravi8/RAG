@@ -21,6 +21,7 @@ from .errors import (
     VectorDimensionError,
 )
 from .factory import RAGApplication, build_demo_rag
+from .fingerprint import INDEX_SCHEMA_VERSION, IndexFingerprint, build_index_fingerprint
 from .generation import DemoExtractiveGenerator
 from .indexing import Indexer
 from .models import (
@@ -80,7 +81,9 @@ __all__ = [
     "HashingEmbedder",
     "InMemoryVectorStore",
     "InMemoryRepositoryManifest",
+    "INDEX_SCHEMA_VERSION",
     "IndexReport",
+    "IndexFingerprint",
     "Indexer",
     "KeywordReranker",
     "OptionalDependencyError",
@@ -121,5 +124,6 @@ __all__ = [
     "VerificationResult",
     "WordWindowChunker",
     "build_demo_rag",
+    "build_index_fingerprint",
     "DefaultSecretScanner",
 ]

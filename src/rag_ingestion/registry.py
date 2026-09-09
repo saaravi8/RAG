@@ -1,13 +1,27 @@
 """Thread-safe registries for pluggable loader and cleaner functions."""
 
 from threading import RLock
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from .errors import DuplicateHandlerError, UnsupportedDocumentTypeError
 from .models import Document, DocumentSource
 
 Loader = Callable[[DocumentSource], Document]
 Cleaner = Callable[[Document], Document]
+
+
+def _handler_description(handler: Callable[..., Document]) -> Mapping[str, Any]:
+    identity = "{}.{}".format(
+        getattr(handler, "__module__", type(handler).__module__),
+        getattr(handler, "__qualname__", type(handler).__qualname__),
+    )
+    describe = getattr(handler, "fingerprint_components", None)
+    if not callable(describe):
+        return {"type": identity, "opaque": True}
+    configuration = describe()
+    if not isinstance(configuration, Mapping):
+        return {"type": identity, "opaque": True}
+    return {"type": identity, "configuration": dict(configuration)}
 
 
 def normalize_document_type(document_type: str) -> str:
@@ -71,6 +85,13 @@ class LoaderRegistry:
                 raise UnsupportedDocumentTypeError(
                     normalized, self._handlers.keys()
                 ) from None
+
+    def fingerprint_components(self):
+        with self._lock:
+            return {
+                document_type: _handler_description(handler)
+                for document_type, handler in sorted(self._handlers.items())
+            }
 
 
 class CleanerRegistry:
@@ -139,3 +160,12 @@ class CleanerRegistry:
                 tuple(self._handlers.get(self.ALL_TYPES, ()))
                 + tuple(self._handlers.get(normalized, ()))
             )
+
+    def fingerprint_components(self):
+        with self._lock:
+            return {
+                document_type: tuple(
+                    _handler_description(handler) for handler in handlers
+                )
+                for document_type, handlers in sorted(self._handlers.items())
+            }
