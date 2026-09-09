@@ -20,6 +20,12 @@ from .errors import (
     UnsafeRepositoryError,
     VectorDimensionError,
 )
+from .evaluation import (
+    EvaluationCase,
+    EvaluationObservation,
+    EvaluationReport,
+    evaluate_observations,
+)
 from .factory import RAGApplication, build_demo_rag
 from .fingerprint import INDEX_SCHEMA_VERSION, IndexFingerprint, build_index_fingerprint
 from .generation import DemoExtractiveGenerator
@@ -88,6 +94,9 @@ __all__ = [
     "DocumentIndex",
     "DocumentProcessor",
     "Embedder",
+    "EvaluationCase",
+    "EvaluationObservation",
+    "EvaluationReport",
     "HashingEmbedder",
     "InMemoryVectorStore",
     "InMemoryRepositoryManifest",
@@ -142,5 +151,6 @@ __all__ = [
     "WordWindowChunker",
     "build_demo_rag",
     "build_index_fingerprint",
+    "evaluate_observations",
     "DefaultSecretScanner",
 ]
