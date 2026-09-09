@@ -19,3 +19,7 @@ Repository manifests participate in coordinated writes. Reuse requires configura
 ## Answer evidence policies
 
 Retrieval and reranking boundaries validate and snapshot evidence before generation. Relevance policies can abstain; optional verification controls unsupported answers. Regression tests cover malicious mutation, weak evidence and verifier failures.
+
+## Deterministic evaluation
+
+Evaluation requires ordered, unambiguous cases and observations. The fixture and regression tests cover ranking metrics, abstention, ownership, duplicates, ordering and invalid numeric inputs.

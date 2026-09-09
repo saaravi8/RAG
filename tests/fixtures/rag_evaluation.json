@@ -1,0 +1,53 @@
+{
+  "documents": [
+    {
+      "document_id": "architecture",
+      "text": "Project Atlas stores application data in PostgreSQL. פרויקט אטלס שומר נתונים במסד PostgreSQL."
+    },
+    {
+      "document_id": "transactions",
+      "text": "Atomic indexing prepares every participant before commit and rolls back failures. עדכון אטומי מכין את כל האינדקסים לפני commit."
+    },
+    {
+      "document_id": "code-delete",
+      "text": "def delete_document(document_id): remove every indexed record owned by document_id"
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "english-database",
+      "question": "Where does Project Atlas store application data?",
+      "relevant_document_ids": ["architecture"]
+    },
+    {
+      "case_id": "hebrew-database",
+      "question": "איפה פרויקט אטלס שומר נתונים?",
+      "relevant_document_ids": ["architecture"]
+    },
+    {
+      "case_id": "english-atomic",
+      "question": "What happens before atomic indexing commit?",
+      "relevant_document_ids": ["transactions"]
+    },
+    {
+      "case_id": "hebrew-atomic",
+      "question": "מה מכין עדכון אטומי לפני commit?",
+      "relevant_document_ids": ["transactions"]
+    },
+    {
+      "case_id": "code-delete-function",
+      "question": "Which function removes records for a document_id?",
+      "relevant_document_ids": ["code-delete"]
+    },
+    {
+      "case_id": "english-unanswerable",
+      "question": "Cafeteria menu schedule?",
+      "relevant_document_ids": []
+    },
+    {
+      "case_id": "hebrew-unanswerable",
+      "question": "מה תחזית מזג האוויר מחר?",
+      "relevant_document_ids": []
+    }
+  ]
+}
