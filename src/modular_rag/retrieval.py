@@ -9,6 +9,14 @@ from .models import SearchResult
 from .ports import Embedder, VectorStore
 
 
+def _positive_int(value: Any, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError("{} must be a positive integer.".format(name))
+    if value <= 0:
+        raise ValueError("{} must be a positive integer.".format(name))
+    return value
+
+
 class VectorRetriever:
     def __init__(self, embedder: Embedder, store: VectorStore) -> None:
         self.embedder = embedder
@@ -21,8 +29,7 @@ class VectorRetriever:
         top_k: int,
         filters: Optional[Mapping[str, Any]] = None,
     ) -> Sequence[SearchResult]:
-        if top_k <= 0:
-            raise ValueError("top_k must be positive.")
+        top_k = _positive_int(top_k, "top_k")
         vector = self.embedder.embed_query(query)
         return self.store.search(vector, top_k=top_k, filters=filters)
 
@@ -35,6 +42,7 @@ class KeywordReranker:
     def rerank(
         self, query: str, results: Sequence[SearchResult], *, top_k: int
     ) -> Sequence[SearchResult]:
+        top_k = _positive_int(top_k, "top_k")
         query_terms = set(self._TOKEN.findall(query.lower()))
 
         def score(result: SearchResult):
@@ -74,10 +82,9 @@ class CrossEncoderReranker:
             raise TypeError("model_name must be a string.")
         if not model_name.strip():
             raise ValueError("model_name cannot be empty.")
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive.")
-        if max_length is not None and max_length <= 0:
-            raise ValueError("max_length must be positive when supplied.")
+        batch_size = _positive_int(batch_size, "batch_size")
+        if max_length is not None:
+            max_length = _positive_int(max_length, "max_length")
 
         self.model_name = model_name
         self.batch_size = batch_size
@@ -92,8 +99,7 @@ class CrossEncoderReranker:
     def rerank(
         self, query: str, results: Sequence[SearchResult], *, top_k: int
     ) -> Sequence[SearchResult]:
-        if top_k <= 0:
-            raise ValueError("top_k must be positive.")
+        top_k = _positive_int(top_k, "top_k")
 
         candidates = tuple(results)
         if not candidates:
@@ -137,21 +143,38 @@ class CrossEncoderReranker:
     @staticmethod
     def _scores(raw_scores: Any, *, expected: int) -> Tuple[float, ...]:
         values = raw_scores.tolist() if hasattr(raw_scores, "tolist") else raw_scores
+        if isinstance(values, (str, bytes, bytearray)):
+            raise ComponentContractError(
+                "Cross-encoder returned malformed relevance scores."
+            )
         try:
-            scores = tuple(float(value) for value in values)
-        except (TypeError, ValueError) as exc:
+            raw_values = tuple(values)
+        except TypeError as exc:
             raise ComponentContractError(
                 "Cross-encoder returned malformed relevance scores."
             ) from exc
+        scores = []
+        for value in raw_values:
+            if isinstance(value, (bool, str, bytes, bytearray)):
+                raise ComponentContractError(
+                    "Cross-encoder returned malformed relevance scores."
+                )
+            try:
+                scores.append(float(value))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ComponentContractError(
+                    "Cross-encoder returned malformed relevance scores."
+                ) from exc
+        normalized_scores = tuple(scores)
 
-        if len(scores) != expected:
+        if len(normalized_scores) != expected:
             raise ComponentContractError(
                 "Cross-encoder returned {} scores for {} candidates.".format(
-                    len(scores), expected
+                    len(normalized_scores), expected
                 )
             )
-        if any(not math.isfinite(score) for score in scores):
+        if any(not math.isfinite(score) for score in normalized_scores):
             raise ComponentContractError(
                 "Cross-encoder returned non-finite relevance scores."
             )
-        return scores
+        return normalized_scores

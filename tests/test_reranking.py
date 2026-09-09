@@ -6,8 +6,10 @@ from modular_rag import (
     ComponentContractError,
     CrossEncoderReranker,
     SearchResult,
+    VectorRecord,
     build_demo_rag,
 )
+from modular_rag.relevance import ScoreThresholdRelevancePolicy
 
 
 class FakeCrossEncoder:
@@ -22,6 +24,11 @@ class FakeCrossEncoder:
 
 def result(chunk_id, text, score):
     return SearchResult(Chunk(chunk_id, "guide", text, 0), score)
+
+
+class OverflowingFloat:
+    def __float__(self):
+        raise OverflowError("too large")
 
 
 class CrossEncoderRerankerTests(unittest.TestCase):
@@ -79,11 +86,32 @@ class CrossEncoderRerankerTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "predict"):
             CrossEncoderReranker(model=object())
 
+        invalid_integer_options = (
+            {"batch_size": True},
+            {"batch_size": 2.0},
+            {"max_length": False},
+            {"max_length": 128.0},
+        )
+        for options in invalid_integer_options:
+            with self.subTest(options=options):
+                with self.assertRaises(TypeError):
+                    CrossEncoderReranker(model=model, **options)
+
+        reranker = CrossEncoderReranker(model=model)
+        for top_k in (True, 1.0):
+            with self.subTest(top_k=top_k):
+                with self.assertRaisesRegex(TypeError, "top_k"):
+                    reranker.rerank("question", (), top_k=top_k)
+
     def test_rejects_malformed_model_scores(self):
         candidate = (result("first", "first passage", 0.9),)
         invalid_outputs = (
             ([], "0 scores for 1 candidates"),
             ([[0.2]], "malformed relevance scores"),
+            ([True], "malformed relevance scores"),
+            (["0.2"], "malformed relevance scores"),
+            ([b"0.2"], "malformed relevance scores"),
+            ([OverflowingFloat()], "malformed relevance scores"),
             ([math.nan], "non-finite relevance scores"),
         )
 
@@ -99,6 +127,39 @@ class CrossEncoderRerankerTests(unittest.TestCase):
         app = build_demo_rag(reranker=reranker)
 
         self.assertIs(app.rag.reranker, reranker)
+
+    def test_factory_supports_negative_logits_with_a_calibrated_policy(self):
+        """Factory wiring preserves an explicitly accepted retrieval score domain."""
+
+        class FixedEmbedder:
+            def embed_documents(self, texts):
+                return tuple((-1.0, 0.0) for _ in texts)
+
+            def embed_query(self, text):
+                del text
+                return (1.0, 0.0)
+
+        reranker = CrossEncoderReranker(model=FakeCrossEncoder([-0.4]))
+        application = build_demo_rag(
+            embedder=FixedEmbedder(),
+            reranker=reranker,
+            relevance_policy=ScoreThresholdRelevancePolicy(-1.1),
+        )
+        application.store.replace_document(
+            "guide",
+            (
+                VectorRecord(
+                    Chunk("c", "guide", "calibrated evidence", 0),
+                    (-1.0, 0.0),
+                ),
+            ),
+        )
+
+        response = application.ask("question", top_k=1)
+
+        self.assertFalse(response.abstained)
+        self.assertEqual(response.results[0].score, -0.4)
+        self.assertEqual(response.citations[0].score, -0.4)
 
 
 if __name__ == "__main__":
