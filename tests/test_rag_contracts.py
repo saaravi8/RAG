@@ -5,13 +5,17 @@ from rag_ingestion import Document
 from modular_rag import (
     AnswerVerifier,
     Chunk,
+    Citation,
     ComponentContractError,
     HashingEmbedder,
     InMemoryVectorStore,
+    IndexReport,
     Indexer,
     QASCConfig,
+    RAGResponse,
     RAGService,
     SearchResult,
+    SentenceSpan,
     VectorDimensionError,
     VectorRecord,
     VerificationResult,
@@ -419,3 +423,263 @@ class FactoryContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DomainModelContractTests(unittest.TestCase):
+    def test_metadata_snapshots_mutable_byte_buffers_as_bytes(self):
+        """Adapter-owned byte buffers cannot mutate a model after construction."""
+
+        byte_buffer = bytearray(b"bytearray")
+        view_buffer = bytearray(b"memoryview")
+        metadata = {
+            "buffers": [byte_buffer, memoryview(view_buffer)],
+            "scalars": [None, True, 1, 1.5, "text", b"bytes"],
+        }
+        models = (
+            SentenceSpan("s", "doc", "sentence", 0, 0, 8, metadata),
+            Chunk("c", "doc", "chunk", 0, metadata),
+            Citation(1, "c", "doc", "source", "chunk", 0.8, metadata),
+            VerificationResult(True, "supported", metadata),
+        )
+
+        byte_buffer[:] = b"spoofed!!!"
+        view_buffer[:] = b"spoofed!!!"
+
+        for model in models:
+            with self.subTest(model=type(model).__name__):
+                self.assertEqual(
+                    model.metadata["buffers"],
+                    (b"bytearray", b"memoryview"),
+                )
+                self.assertEqual(
+                    model.metadata["scalars"],
+                    (None, True, 1, 1.5, "text", b"bytes"),
+                )
+
+    def test_metadata_rejects_values_outside_the_builtin_domain(self):
+        """Custom mutable objects and non-string keys cannot escape by reference."""
+
+        class MutableMetadata:
+            def __init__(self):
+                self.value = "mutable"
+
+        invalid_metadata = (
+            {"custom": MutableMetadata()},
+            {"nested": [MutableMetadata()]},
+            {1: "non-string key"},
+        )
+        for metadata in invalid_metadata:
+            with self.subTest(metadata=metadata):
+                with self.assertRaisesRegex(TypeError, "metadata"):
+                    Chunk("c", "doc", "chunk", 0, metadata)
+
+    def test_public_model_text_fields_require_non_whitespace_strings(self):
+        """Bool/int/float coercion and blank identity text fail at construction."""
+
+        field_factories = (
+            (
+                "SentenceSpan.id",
+                lambda value: SentenceSpan(value, "doc", "text", 0, 0, 1),
+            ),
+            (
+                "SentenceSpan.document_id",
+                lambda value: SentenceSpan("s", value, "text", 0, 0, 1),
+            ),
+            (
+                "SentenceSpan.text",
+                lambda value: SentenceSpan("s", "doc", value, 0, 0, 1),
+            ),
+            ("Chunk.id", lambda value: Chunk(value, "doc", "text", 0)),
+            (
+                "Chunk.document_id",
+                lambda value: Chunk("c", value, "text", 0),
+            ),
+            ("Chunk.text", lambda value: Chunk("c", "doc", value, 0)),
+            (
+                "IndexReport.document_id",
+                lambda value: IndexReport(value, 0),
+            ),
+            (
+                "Citation.chunk_id",
+                lambda value: Citation(
+                    1, value, "doc", "source", "excerpt", 0.8
+                ),
+            ),
+            (
+                "Citation.document_id",
+                lambda value: Citation(
+                    1, "c", value, "source", "excerpt", 0.8
+                ),
+            ),
+            (
+                "Citation.source",
+                lambda value: Citation(
+                    1, "c", "doc", value, "excerpt", 0.8
+                ),
+            ),
+            (
+                "Citation.excerpt",
+                lambda value: Citation(
+                    1, "c", "doc", "source", value, 0.8
+                ),
+            ),
+        )
+        invalid_values = (
+            (True, TypeError),
+            (1, TypeError),
+            (1.0, TypeError),
+            (" \t\n", ValueError),
+        )
+
+        for field, factory in field_factories:
+            for value, error in invalid_values:
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(error, field):
+                        factory(value)
+
+    def test_public_model_integer_fields_reject_bool_float_and_bad_ranges(self):
+        """Only real integers enter positional domains; each existing bound remains."""
+
+        field_factories = (
+            (
+                "SentenceSpan.index",
+                lambda value: SentenceSpan("s", "doc", "text", value, 0, 1),
+                -1,
+            ),
+            (
+                "SentenceSpan.start_char",
+                lambda value: SentenceSpan("s", "doc", "text", 0, value, 1),
+                -1,
+            ),
+            (
+                "SentenceSpan.end_char",
+                lambda value: SentenceSpan("s", "doc", "text", 0, 0, value),
+                0,
+            ),
+            (
+                "Chunk.index",
+                lambda value: Chunk("c", "doc", "text", value),
+                -1,
+            ),
+            (
+                "IndexReport.chunk_count",
+                lambda value: IndexReport("doc", value),
+                -1,
+            ),
+            (
+                "Citation.number",
+                lambda value: Citation(
+                    value, "c", "doc", "source", "excerpt", 0.8
+                ),
+                0,
+            ),
+        )
+
+        for field, factory, out_of_range in field_factories:
+            for value in (True, 1.0):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(TypeError, field):
+                        factory(value)
+            with self.subTest(field=field, value=out_of_range):
+                with self.assertRaisesRegex(ValueError, field):
+                    factory(out_of_range)
+
+        self.assertEqual(SentenceSpan("s", "doc", "text", 0, 0, 1).index, 0)
+        self.assertEqual(Chunk("c", "doc", "text", 0).index, 0)
+        self.assertEqual(IndexReport("doc", 0).chunk_count, 0)
+        self.assertEqual(
+            Citation(1, "c", "doc", "source", "excerpt", 0.8).number,
+            1,
+        )
+
+    def test_vector_record_requires_a_chunk(self):
+        """A valid vector cannot legitimize a record without domain evidence."""
+
+        with self.assertRaisesRegex(TypeError, "chunk must be a Chunk"):
+            VectorRecord(object(), (1.0,))
+
+    def test_evidence_metadata_is_a_deep_immutable_snapshot(self):
+        """Nested caller containers cannot mutate stored evidence or diagnostics."""
+
+        metadata = {
+            "nested": {
+                "labels": ["trusted"],
+                "flags": {"verified"},
+            }
+        }
+        models = (
+            SentenceSpan("s", "doc", "sentence", 0, 0, 8, metadata),
+            Chunk("c", "doc", "chunk", 0, metadata),
+            Citation(1, "c", "doc", "source", "chunk", 0.8, metadata),
+            VerificationResult(True, "supported", metadata),
+        )
+
+        metadata["nested"]["labels"].append("spoofed")
+        metadata["nested"]["flags"].add("spoofed")
+        metadata["nested"]["new"] = "spoofed"
+
+        for model in models:
+            with self.subTest(model=type(model).__name__):
+                nested = model.metadata["nested"]
+                self.assertEqual(nested["labels"], ("trusted",))
+                self.assertEqual(nested["flags"], frozenset({"verified"}))
+                self.assertNotIn("new", nested)
+                with self.assertRaises(TypeError):
+                    model.metadata["new"] = "spoofed"
+                with self.assertRaises(TypeError):
+                    nested["new"] = "spoofed"
+
+    def test_search_result_requires_a_chunk(self):
+        """Malformed evidence cannot defer a missing Chunk failure into orchestration."""
+
+        with self.assertRaisesRegex(TypeError, "chunk must be a Chunk"):
+            SearchResult(object(), 0.8)
+
+    def test_rag_response_snapshots_typed_containers_and_aligns_citations(self):
+        """Responses expose stable tuples whose citations identify the same results."""
+
+        result = SearchResult(Chunk("c", "doc", "evidence", 0), 0.8)
+        citation = Citation(1, "c", "doc", "source", "evidence", 0.8)
+        citations = [citation]
+        results = [result]
+
+        response = RAGResponse("question", "answer", citations, results)
+        citations.clear()
+        results.clear()
+
+        self.assertEqual(response.citations, (citation,))
+        self.assertEqual(response.results, (result,))
+        self.assertIsInstance(response.citations, tuple)
+        self.assertIsInstance(response.results, tuple)
+
+        invalid_responses = (
+            ((1, "answer", (), ()), TypeError),
+            (("question", object(), (), ()), TypeError),
+            (("question", "answer", (object(),), (result,)), TypeError),
+            (("question", "answer", (citation,), (object(),)), TypeError),
+            (("question", "answer", (), (result,)), ValueError),
+            (
+                (
+                    "question",
+                    "answer",
+                    (Citation(1, "other", "doc", "source", "evidence", 0.8),),
+                    (result,),
+                ),
+                ValueError,
+            ),
+        )
+        for arguments, error in invalid_responses:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(error):
+                    RAGResponse(*arguments)
+
+        abstention = RAGResponse(
+            "question",
+            "Insufficient evidence.",
+            [],
+            [],
+            abstained=True,
+            abstention_reason="no_relevant_evidence",
+        )
+        self.assertEqual(abstention.citations, ())
+        self.assertEqual(abstention.results, ())
