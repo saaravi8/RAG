@@ -23,3 +23,7 @@ Retrieval and reranking boundaries validate and snapshot evidence before generat
 ## Deterministic evaluation
 
 Evaluation requires ordered, unambiguous cases and observations. The fixture and regression tests cover ranking metrics, abstention, ownership, duplicates, ordering and invalid numeric inputs.
+
+## Packaging and CI
+
+CI checks dependency consistency, source compilation, optional adapters across supported Python versions, and installed wheel metadata. Full user and test documentation accompanies the integrated workflow. Remote CI awaits push approval.
