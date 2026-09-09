@@ -53,6 +53,7 @@ from .ports import (
     VectorStore,
 )
 from .qasc import QASCConfig, QASCRetriever
+from .relevance import RelevancePolicy, ScoreThresholdRelevancePolicy
 from .repository import (
     DefaultSecretScanner,
     InMemoryRepositoryManifest,
@@ -69,9 +70,11 @@ from .repository import (
 from .retrieval import CrossEncoderReranker, KeywordReranker, VectorRetriever
 from .service import RAGService
 from .transactions import IndexTransactionCoordinator
+from .verification import AnswerVerificationPolicy
 
 __all__ = [
     "AnswerGenerator",
+    "AnswerVerificationPolicy",
     "AnswerVerifier",
     "BuiltinSyntaxParser",
     "Chunk",
@@ -114,8 +117,10 @@ __all__ = [
     "RepositoryManifestEntry",
     "RepositoryPolicy",
     "RepositoryResourceLimitError",
+    "RelevancePolicy",
     "RoutingChunker",
     "SearchResult",
+    "ScoreThresholdRelevancePolicy",
     "SentenceSegmenter",
     "SentenceSpan",
     "SentenceTransformerEmbedder",

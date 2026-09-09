@@ -13,12 +13,14 @@ from .generation import DemoExtractiveGenerator
 from .indexing import Indexer
 from .models import IndexReport, RAGResponse
 from .ports import (
+    AnswerVerifier,
     DocumentProcessor,
     Embedder,
     Reranker,
     SentenceSegmenter,
 )
 from .qasc import QASCConfig, QASCRetriever
+from .relevance import RelevancePolicy
 from .repository import (
     InMemoryRepositoryManifest,
     RepositoryIndexReport,
@@ -29,6 +31,7 @@ from .repository import (
 from .retrieval import KeywordReranker, VectorRetriever
 from .service import RAGService
 from .transactions import IndexTransactionCoordinator
+from .verification import AnswerVerificationPolicy
 
 
 @dataclass
@@ -62,6 +65,9 @@ def build_demo_rag(
     processor: Optional[DocumentProcessor] = None,
     embedder: Optional[Embedder] = None,
     reranker: Optional[Reranker] = None,
+    relevance_policy: Optional[RelevancePolicy] = None,
+    answer_verifier: Optional[AnswerVerifier] = None,
+    verification_policy: Optional[AnswerVerificationPolicy] = None,
     code_parser: Optional[Any] = None,
     code_max_lines: int = 200,
     code_overlap_lines: int = 20,
@@ -136,6 +142,9 @@ def build_demo_rag(
         retriever,
         DemoExtractiveGenerator(),
         reranker=reranker if reranker is not None else KeywordReranker(),
+        relevance_policy=relevance_policy,
+        answer_verifier=answer_verifier,
+        verification_policy=verification_policy,
         query_methods=query_methods,
     )
     repository_indexer = RepositoryIndexer(

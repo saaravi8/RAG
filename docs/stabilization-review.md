@@ -15,3 +15,7 @@ Primary storage and QASC share prepare/commit/rollback ownership. Invalid vector
 ## Repository lifecycle
 
 Repository manifests participate in coordinated writes. Reuse requires configuration and physical evidence state to match. Bounded discovery loads ignore rules before limiting files and preserves unseen evidence. Tests cover rollback, stale cleanup, reuse invalidation and incremental state updates.
+
+## Answer evidence policies
+
+Retrieval and reranking boundaries validate and snapshot evidence before generation. Relevance policies can abstain; optional verification controls unsupported answers. Regression tests cover malicious mutation, weak evidence and verifier failures.
