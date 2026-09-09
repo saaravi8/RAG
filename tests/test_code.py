@@ -12,6 +12,7 @@ from modular_rag import (
     SyntaxParseResult,
     SyntaxSpan,
     TreeSitterSyntaxParser,
+    WordWindowChunker,
 )
 
 
@@ -208,6 +209,51 @@ class CodeChunkerTests(unittest.TestCase):
             with self.subTest(arguments=arguments):
                 with self.assertRaises(ValueError):
                     CodeChunker(**arguments)
+
+    def test_word_and_code_chunkers_require_real_integer_window_limits(self):
+        """Booleans and fractional sizes cannot silently become window geometry."""
+
+        constructors = (
+            (WordWindowChunker, "max_words", "overlap_words"),
+            (CodeChunker, "max_lines", "overlap_lines"),
+        )
+        for constructor, maximum_name, overlap_name in constructors:
+            invalid_types = (
+                {maximum_name: True},
+                {maximum_name: 4.0},
+                {maximum_name: "4"},
+                {overlap_name: False},
+                {overlap_name: 1.0},
+                {overlap_name: "1"},
+            )
+            for arguments in invalid_types:
+                with self.subTest(
+                    constructor=constructor.__name__, arguments=arguments
+                ):
+                    with self.assertRaises(TypeError):
+                        constructor(**arguments)
+
+    def test_word_and_code_chunkers_keep_range_failures_as_value_errors(self):
+        """Correctly typed limits still require positive size and forward progress."""
+
+        cases = (
+            (WordWindowChunker, {"max_words": 0}),
+            (WordWindowChunker, {"max_words": -1}),
+            (WordWindowChunker, {"max_words": 4, "overlap_words": -1}),
+            (WordWindowChunker, {"max_words": 4, "overlap_words": 4}),
+            (WordWindowChunker, {"max_words": 4, "overlap_words": 5}),
+            (CodeChunker, {"max_lines": 0}),
+            (CodeChunker, {"max_lines": -1}),
+            (CodeChunker, {"max_lines": 4, "overlap_lines": -1}),
+            (CodeChunker, {"max_lines": 4, "overlap_lines": 4}),
+            (CodeChunker, {"max_lines": 4, "overlap_lines": 5}),
+        )
+        for constructor, arguments in cases:
+            with self.subTest(
+                constructor=constructor.__name__, arguments=arguments
+            ):
+                with self.assertRaises(ValueError):
+                    constructor(**arguments)
 
 
 class TreeSitterSyntaxParserTests(unittest.TestCase):

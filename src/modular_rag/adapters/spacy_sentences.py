@@ -1,6 +1,7 @@
 """spaCy adapter for sentence-boundary identification."""
 
 import hashlib
+import importlib.metadata
 from typing import Any, Optional, Sequence
 
 from rag_ingestion import Document
@@ -25,6 +26,9 @@ class SpacySentenceSegmenter:
         punct_chars: Optional[Sequence[str]] = None,
         nlp: Optional[Any] = None,
     ) -> None:
+        self.language = language
+        self.punct_chars = tuple(punct_chars) if punct_chars is not None else None
+        self._injected_nlp = nlp is not None
         if nlp is not None:
             if not callable(nlp):
                 raise TypeError("nlp must be a callable spaCy Language pipeline.")
@@ -44,6 +48,21 @@ class SpacySentenceSegmenter:
         if punct_chars is not None:
             config["punct_chars"] = list(punct_chars)
         self._nlp.add_pipe("sentencizer", config=config)
+
+    def fingerprint_components(self):
+        try:
+            provider_version = importlib.metadata.version("spacy")
+        except importlib.metadata.PackageNotFoundError:
+            provider_version = "unknown"
+        return {
+            "algorithm": "spacy-sentence-boundaries",
+            "algorithm_version": 1,
+            "provider_version": provider_version,
+            "language": self.language,
+            "punct_chars": self.punct_chars,
+            "injected_nlp": self._injected_nlp,
+            "opaque": self._injected_nlp,
+        }
 
     def segment(self, document: Document) -> Sequence[SentenceSpan]:
         parsed = self._nlp(document.text)

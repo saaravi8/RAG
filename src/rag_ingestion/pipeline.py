@@ -114,6 +114,22 @@ class DocumentPipeline:
         )
         return self.clean(document)
 
+    def fingerprint_components(self):
+        loaders = getattr(self.loaders, "fingerprint_components", None)
+        cleaners = getattr(self.cleaners, "fingerprint_components", None)
+        if not callable(loaders) or not callable(cleaners):
+            return {
+                "algorithm": "document-pipeline",
+                "algorithm_version": 1,
+                "opaque": True,
+            }
+        return {
+            "algorithm": "document-pipeline",
+            "algorithm_version": 1,
+            "loaders": loaders(),
+            "cleaners": cleaners(),
+        }
+
     @staticmethod
     def _validate_result(result: object, stage: str, document_type: str) -> None:
         if not isinstance(result, Document):

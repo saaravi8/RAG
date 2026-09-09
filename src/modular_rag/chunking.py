@@ -15,6 +15,10 @@ class WordWindowChunker:
     _WORD = re.compile(r"\S+")
 
     def __init__(self, max_words: int = 200, overlap_words: int = 30) -> None:
+        if isinstance(max_words, bool) or not isinstance(max_words, int):
+            raise TypeError("max_words must be an integer.")
+        if isinstance(overlap_words, bool) or not isinstance(overlap_words, int):
+            raise TypeError("overlap_words must be an integer.")
         if max_words <= 0:
             raise ValueError("max_words must be positive.")
         if overlap_words < 0 or overlap_words >= max_words:
@@ -60,6 +64,14 @@ class WordWindowChunker:
                 break
 
         return tuple(chunks)
+
+    def fingerprint_components(self):
+        return {
+            "algorithm": "word-window",
+            "algorithm_version": 1,
+            "max_words": self.max_words,
+            "overlap_words": self.overlap_words,
+        }
 
     @staticmethod
     def _document_id(document: Document) -> str:

@@ -18,6 +18,11 @@ class FakeSentenceTransformer:
         return 2
 
 
+class OverflowingFloat:
+    def __float__(self):
+        raise OverflowError("too large")
+
+
 class SentenceTransformerEmbedderTests(unittest.TestCase):
     def test_applies_e5_retrieval_prefixes_and_encoding_options(self):
         model = FakeSentenceTransformer()
@@ -55,6 +60,25 @@ class SentenceTransformerEmbedderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exceeds the model limit"):
             SentenceTransformerEmbedder(model=model, max_seq_length=513)
 
+        invalid_integer_options = (
+            {"batch_size": True},
+            {"batch_size": 8.0},
+            {"max_seq_length": False},
+            {"max_seq_length": 384.0},
+        )
+        for options in invalid_integer_options:
+            with self.subTest(options=options):
+                with self.assertRaises(TypeError):
+                    SentenceTransformerEmbedder(model=model, **options)
+
+    def test_rejects_malformed_model_revisions_at_construction(self):
+        model = FakeSentenceTransformer()
+
+        with self.assertRaisesRegex(TypeError, "revision"):
+            SentenceTransformerEmbedder(model=model, revision=123)
+        with self.assertRaisesRegex(ValueError, "revision"):
+            SentenceTransformerEmbedder(model=model, revision="   ")
+
     def test_factory_uses_an_injected_embedder(self):
         embedder = SentenceTransformerEmbedder(model=FakeSentenceTransformer())
 
@@ -72,6 +96,23 @@ class SentenceTransformerEmbedderTests(unittest.TestCase):
 
         with self.assertRaisesRegex(TypeError, "non-finite"):
             embedder.embed_query("question")
+
+    def test_rejects_coercible_and_overflowing_embedding_coordinates(self):
+        """Backend coordinates must be numeric values, not coercible impostors."""
+
+        invalid_coordinates = (True, "1.0", b"1.0", OverflowingFloat())
+        for coordinate in invalid_coordinates:
+            with self.subTest(coordinate=coordinate):
+                class BrokenModel(FakeSentenceTransformer):
+                    def encode(self, texts, **kwargs):
+                        del texts, kwargs
+                        return [[coordinate, 1.0]]
+
+                embedder = SentenceTransformerEmbedder(model=BrokenModel())
+                with self.assertRaisesRegex(
+                    TypeError, "malformed embeddings"
+                ):
+                    embedder.embed_query("question")
 
 
 if __name__ == "__main__":

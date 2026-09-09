@@ -20,6 +20,7 @@ from typing import (
 from rag_ingestion import Document
 
 from .errors import OptionalDependencyError
+from .fingerprint import describe_component
 from .models import Chunk
 from .ports import Chunker
 
@@ -122,6 +123,12 @@ class BuiltinSyntaxParser:
             re.IGNORECASE,
         ),
     }
+
+    def fingerprint_components(self):
+        return {
+            "algorithm": "builtin-safe-syntax",
+            "algorithm_version": 1,
+        }
 
     def parse(self, text: str, language: str) -> SyntaxParseResult:
         """Describe declarations without importing or executing ``text``."""
@@ -276,6 +283,48 @@ class TreeSitterSyntaxParser:
                 "fallback",
             )
 
+    def fingerprint_components(self):
+        fallback, fallback_reusable = describe_component(self._fallback)
+        grammar_inventory, inventory_reusable = self._grammar_inventory()
+        return {
+            "algorithm": "tree-sitter-with-fallback",
+            "provider_version": self._version(),
+            "grammar_inventory": grammar_inventory,
+            "fallback": fallback,
+            "custom_parser_factory": self._parser_factory is not None,
+            "opaque": (
+                self._parser_factory is not None
+                or not fallback_reusable
+                or not inventory_reusable
+            ),
+        }
+
+    @staticmethod
+    def _grammar_inventory() -> Tuple[Mapping[str, Any], bool]:
+        try:
+            from tree_sitter_language_pack import downloaded_languages
+        except ImportError:
+            try:
+                import tree_sitter_languages  # noqa: F401
+            except ImportError:
+                return {"provider": "none", "languages": ()}, True
+            return {
+                "provider": "tree-sitter-languages",
+                "languages": "bundled",
+            }, True
+        try:
+            languages = tuple(sorted(str(item) for item in downloaded_languages()))
+        except Exception:
+            return {
+                "provider": "tree-sitter-language-pack",
+                "inventory": "unavailable",
+                "opaque": True,
+            }, False
+        return {
+            "provider": "tree-sitter-language-pack",
+            "languages": languages,
+        }, True
+
     def _parser(self, language: str) -> Any:
         if language in self._parsers:
             return self._parsers[language]
@@ -375,6 +424,10 @@ class CodeChunker:
         overlap_lines: int = 20,
         parser: Optional[Any] = None,
     ) -> None:
+        if isinstance(max_lines, bool) or not isinstance(max_lines, int):
+            raise TypeError("max_lines must be an integer.")
+        if isinstance(overlap_lines, bool) or not isinstance(overlap_lines, int):
+            raise TypeError("overlap_lines must be an integer.")
         if max_lines <= 0:
             raise ValueError("max_lines must be positive.")
         if overlap_lines < 0 or overlap_lines >= max_lines:
@@ -434,6 +487,17 @@ class CodeChunker:
                 )
             )
         return tuple(chunks)
+
+    def fingerprint_components(self):
+        parser, parser_reusable = describe_component(self.parser)
+        return {
+            "algorithm": "syntax-aware-line-window",
+            "algorithm_version": 1,
+            "max_lines": self.max_lines,
+            "overlap_lines": self.overlap_lines,
+            "parser": parser,
+            "opaque": not parser_reusable,
+        }
 
     def _ranges(
         self, line_count: int, spans: Sequence[SyntaxSpan]
@@ -594,3 +658,14 @@ class RoutingChunker:
         if document.metadata.get("content_kind") in {"code", "config"}:
             return self.code.chunk(document)
         return self.default.chunk(document)
+
+    def fingerprint_components(self):
+        default, default_reusable = describe_component(self.default)
+        code, code_reusable = describe_component(self.code)
+        return {
+            "algorithm": "content-kind-routing",
+            "algorithm_version": 1,
+            "default": default,
+            "code": code,
+            "opaque": not default_reusable or not code_reusable,
+        }

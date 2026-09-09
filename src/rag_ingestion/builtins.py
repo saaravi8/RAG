@@ -14,6 +14,18 @@ from .models import Document, DocumentSource
 from .pipeline import DocumentPipeline
 
 
+def _mark_handler(handler, name: str, **configuration):
+    def fingerprint_components():
+        return {
+            "handler": name,
+            "handler_version": 1,
+            **configuration,
+        }
+
+    handler.fingerprint_components = fingerprint_components
+    return handler
+
+
 def make_text_loader(encoding: str = "utf-8") -> Callable[[DocumentSource], Document]:
     """Create a plain-text loader with a configurable encoding."""
 
@@ -24,7 +36,7 @@ def make_text_loader(encoding: str = "utf-8") -> Callable[[DocumentSource], Docu
             document_type=source.document_type,
         )
 
-    return load_text
+    return _mark_handler(load_text, "plain-text", encoding=encoding)
 
 
 def load_pdf(source: DocumentSource) -> Document:
@@ -240,6 +252,16 @@ def normalize_text(document: Document) -> Document:
         compacted.pop()
 
     return document.with_text("\n".join(compacted))
+
+
+for _handler, _name in (
+    (load_pdf, "pdf-text-extraction"),
+    (load_json, "canonical-json"),
+    (load_csv, "labelled-csv"),
+    (load_html, "visible-html-text"),
+    (normalize_text, "unicode-text-normalization"),
+):
+    _mark_handler(_handler, _name)
 
 
 def create_default_pipeline() -> DocumentPipeline:
