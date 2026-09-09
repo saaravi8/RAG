@@ -1,6 +1,6 @@
 """Protocols defining every component that an application may replace."""
 
-from typing import Any, Mapping, Optional, Protocol, Sequence
+from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 from rag_ingestion import Document
 
@@ -12,6 +12,7 @@ from .models import (
     VectorRecord,
     VerificationResult,
 )
+from .transactions import IndexTransactionCoordinator
 
 
 class DocumentProcessor(Protocol):
@@ -42,6 +43,67 @@ class DocumentIndex(Protocol):
         ...
 
     def delete_document(self, document_id: str) -> int:
+        ...
+
+
+class PreparedDocumentReplacement(Protocol):
+    """A staged document replacement participating in a coordinated write.
+
+    Preparing a replacement must not change query-visible state. ``commit``
+    should normally perform only a prebuilt, component-local atomic state swap.
+    ``rollback`` must be non-raising and idempotent. It must discard an
+    uncommitted replacement and restore the complete pre-prepare state when
+    the committed candidate is still current. If a newer write has taken
+    ownership, rollback must leave that newer state intact rather than restore
+    a stale snapshot.
+    """
+
+    def commit(self) -> None:
+        ...
+
+    def rollback(self) -> None:
+        ...
+
+
+class PreparedDocumentDeletion(PreparedDocumentReplacement, Protocol):
+    """A staged deletion exposing the primary component's removal count."""
+
+    @property
+    def deleted_count(self) -> int:
+        ...
+
+
+@runtime_checkable
+class CoordinatedPreparedDocumentReplacement(
+    PreparedDocumentReplacement, Protocol
+):
+    """A dynamic prepared change bound to one transaction coordinator.
+
+    Primary and configured auxiliary participants expose their coordinator on
+    the participant itself. Additional preparations have no separately
+    configured participant for the Indexer to validate, so their returned
+    handles must carry this explicit ownership binding.
+    """
+
+    @property
+    def transaction_coordinator(self) -> IndexTransactionCoordinator:
+        ...
+
+
+@runtime_checkable
+class TransactionalDocumentIndex(DocumentIndex, Protocol):
+    """Document index capable of failure-atomic coordinated replacement."""
+
+    transaction_coordinator: IndexTransactionCoordinator
+
+    def prepare_replace_document(
+        self, document: Document
+    ) -> PreparedDocumentReplacement:
+        ...
+
+    def prepare_delete_document(
+        self, document_id: str
+    ) -> PreparedDocumentDeletion:
         ...
 
 
@@ -76,6 +138,23 @@ class VectorStore(Protocol):
         top_k: int,
         filters: Optional[Mapping[str, Any]] = None,
     ) -> Sequence[SearchResult]:
+        ...
+
+
+@runtime_checkable
+class TransactionalVectorStore(VectorStore, Protocol):
+    """Vector store capable of failure-atomic coordinated replacement."""
+
+    transaction_coordinator: IndexTransactionCoordinator
+
+    def prepare_replace_document(
+        self, document_id: str, records: Sequence[VectorRecord]
+    ) -> PreparedDocumentReplacement:
+        ...
+
+    def prepare_delete_document(
+        self, document_id: str
+    ) -> PreparedDocumentDeletion:
         ...
 
 

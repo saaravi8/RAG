@@ -23,6 +23,7 @@ from .repository import (
 )
 from .retrieval import KeywordReranker, VectorRetriever
 from .service import RAGService
+from .transactions import IndexTransactionCoordinator
 
 
 @dataclass
@@ -87,7 +88,8 @@ def build_demo_rag(
     selected_embedder = (
         embedder if embedder is not None else HashingEmbedder(dimensions)
     )
-    store = InMemoryVectorStore()
+    transaction_coordinator = IndexTransactionCoordinator()
+    store = InMemoryVectorStore(transaction_coordinator=transaction_coordinator)
     query_methods = {}
     document_indexes = ()
     if enable_qasc:
@@ -96,7 +98,7 @@ def build_demo_rag(
             if qasc_segmenter is not None
             else SpacySentenceSegmenter()
         )
-        qasc = QASCRetriever(segmenter, selected_embedder, config=qasc_config)
+        qasc = QASCRetriever(segmenter, selected_embedder, config=qasc_config, transaction_coordinator=transaction_coordinator)
         query_methods["qasc"] = qasc
         document_indexes = (qasc,)
     elif qasc_segmenter is not None or qasc_config is not None:
@@ -108,6 +110,7 @@ def build_demo_rag(
         selected_embedder,
         store,
         document_indexes=document_indexes,
+        transaction_coordinator=transaction_coordinator,
     )
     retriever = VectorRetriever(selected_embedder, store)
     rag = RAGService(
