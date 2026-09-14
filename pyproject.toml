@@ -23,7 +23,7 @@ reranking = [
 code = [
     "tree-sitter-language-pack>=1.12.3,<2; python_version >= '3.10'",
     "tree-sitter-languages==1.10.2; python_version == '3.9'",
-    "tree-sitter==0.21.3; python_version == '3.9'",
+    "tree-sitter==0.26.0; python_version == '3.9'",
 ]
 spacy = [
     "spacy>=3.7.5,<3.8; python_version == '3.9'",
