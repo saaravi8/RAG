@@ -2,6 +2,7 @@
 
 from .adapters import InMemoryVectorStore, SpacySentenceSegmenter
 from .chunking import WordWindowChunker
+from .content_risk import AllowAllContentRiskPolicy, PromptInjectionContentRiskPolicy
 from .code import (
     BuiltinSyntaxParser,
     CodeChunker,
@@ -45,6 +46,7 @@ from .ports import (
     AnswerGenerator,
     AnswerVerifier,
     Chunker,
+    ContentRiskPolicy,
     CoordinatedPreparedDocumentReplacement,
     DocumentIndex,
     DocumentProcessor,
@@ -82,11 +84,13 @@ __all__ = [
     "AnswerGenerator",
     "AnswerVerificationPolicy",
     "AnswerVerifier",
+    "AllowAllContentRiskPolicy",
     "BuiltinSyntaxParser",
     "Chunk",
     "Chunker",
     "Citation",
     "ComponentContractError",
+    "ContentRiskPolicy",
     "CoordinatedPreparedDocumentReplacement",
     "CodeChunker",
     "CrossEncoderReranker",
@@ -109,6 +113,7 @@ __all__ = [
     "OptionalDependencyError",
     "PreparedDocumentReplacement",
     "PreparedDocumentDeletion",
+    "PromptInjectionContentRiskPolicy",
     "QASCConfig",
     "QASCRetriever",
     "RAGApplication",

@@ -12,6 +12,7 @@ from rag_ingestion import Document
 
 from .errors import ComponentContractError, VectorDimensionError
 from .fingerprint import describe_component
+from .filters import snapshot_filters
 from .models import Chunk, SearchResult, SentenceSpan, Vector, _immutable_metadata
 from .ports import (
     Embedder,
@@ -368,6 +369,7 @@ class QASCRetriever:
             raise TypeError("top_k must be an integer.")
         if top_k <= 0:
             raise ValueError("top_k must be positive.")
+        selected_filters = snapshot_filters(filters)
 
         query_vector = self._normalize_vector(
             self.embedder.embed_query(query),
@@ -387,9 +389,10 @@ class QASCRetriever:
                 documents = tuple(self._documents.items())
 
         results = []
-        selected_filters = filters or {}
         for document_id, sentence_document in documents:
-            if not self._matches(document_id, sentence_document, selected_filters):
+            if not self._matches(
+                document_id, sentence_document, selected_filters or {}
+            ):
                 continue
             results.extend(
                 self._document_results(query_vector, sentence_document)

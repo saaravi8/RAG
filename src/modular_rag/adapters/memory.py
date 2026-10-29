@@ -6,6 +6,7 @@ from threading import RLock
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from ..errors import ComponentContractError, VectorDimensionError
+from ..filters import snapshot_filters
 from ..models import SearchResult, Vector, VectorRecord
 from ..ports import PreparedDocumentDeletion, PreparedDocumentReplacement
 from ..transactions import IndexTransactionCoordinator
@@ -235,6 +236,7 @@ class InMemoryVectorStore:
             raise TypeError("top_k must be an integer.")
         if top_k <= 0:
             raise ValueError("top_k must be positive.")
+        selected_filters = snapshot_filters(filters)
         query_vector = self._normalize_vector(query_vector, label="Query vector")
 
         with self.transaction_coordinator.synchronized():
@@ -250,7 +252,7 @@ class InMemoryVectorStore:
         results = [
             SearchResult(record.chunk, self._cosine(query_vector, record.vector))
             for record in records
-            if self._matches(record, filters or {})
+            if self._matches(record, selected_filters or {})
         ]
         return tuple(
             sorted(results, key=lambda result: (-result.score, result.chunk.id))[:top_k]

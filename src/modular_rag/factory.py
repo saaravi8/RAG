@@ -14,6 +14,7 @@ from .indexing import Indexer
 from .models import IndexReport, RAGResponse
 from .ports import (
     AnswerVerifier,
+    ContentRiskPolicy,
     DocumentProcessor,
     Embedder,
     Reranker,
@@ -65,6 +66,7 @@ def build_demo_rag(
     processor: Optional[DocumentProcessor] = None,
     embedder: Optional[Embedder] = None,
     reranker: Optional[Reranker] = None,
+    content_risk_policy: Optional[ContentRiskPolicy] = None,
     relevance_policy: Optional[RelevancePolicy] = None,
     answer_verifier: Optional[AnswerVerifier] = None,
     verification_policy: Optional[AnswerVerificationPolicy] = None,
@@ -142,6 +144,7 @@ def build_demo_rag(
         retriever,
         DemoExtractiveGenerator(),
         reranker=reranker if reranker is not None else KeywordReranker(),
+        content_risk_policy=content_risk_policy,
         relevance_policy=relevance_policy,
         answer_verifier=answer_verifier,
         verification_policy=verification_policy,

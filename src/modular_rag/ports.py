@@ -176,6 +176,19 @@ class Reranker(Protocol):
         ...
 
 
+class ContentRiskPolicy(Protocol):
+    """Select evidence that may be exposed to downstream model components."""
+
+    def select_safe(
+        self,
+        question: str,
+        results: Sequence[SearchResult],
+        *,
+        method: str,
+    ) -> Sequence[SearchResult]:
+        ...
+
+
 class AnswerGenerator(Protocol):
     def generate(self, question: str, contexts: Sequence[SearchResult]) -> str:
         ...

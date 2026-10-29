@@ -3,9 +3,17 @@
 import math
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
+from .content_risk import PromptInjectionContentRiskPolicy
 from .errors import ComponentContractError
+from .filters import snapshot_filters
 from .models import Chunk, Citation, RAGResponse, SearchResult, VerificationResult
-from .ports import AnswerGenerator, AnswerVerifier, Reranker, Retriever
+from .ports import (
+    AnswerGenerator,
+    AnswerVerifier,
+    ContentRiskPolicy,
+    Reranker,
+    Retriever,
+)
 from .relevance import RelevancePolicy, ScoreThresholdRelevancePolicy
 from .verification import AnswerVerificationPolicy
 
@@ -33,6 +41,7 @@ class RAGService:
         generator: AnswerGenerator,
         *,
         reranker: Optional[Reranker] = None,
+        content_risk_policy: Optional[ContentRiskPolicy] = None,
         relevance_policy: Optional[RelevancePolicy] = None,
         answer_verifier: Optional[AnswerVerifier] = None,
         verification_policy: Optional[AnswerVerificationPolicy] = None,
@@ -47,6 +56,11 @@ class RAGService:
         self.retriever = retriever
         self.generator = generator
         self.reranker = reranker
+        self.content_risk_policy = (
+            content_risk_policy
+            if content_risk_policy is not None
+            else PromptInjectionContentRiskPolicy()
+        )
         self.relevance_policy = (
             relevance_policy
             if relevance_policy is not None
@@ -112,13 +126,32 @@ class RAGService:
             final_k,
             self.default_fetch_k if self.reranker is not None else final_k,
         )
-        retrieved = retriever.retrieve(question, top_k=fetch_k, filters=filters)
+        canonical_filters = snapshot_filters(filters)
+        retrieved = retriever.retrieve(
+            question, top_k=fetch_k, filters=canonical_filters
+        )
         candidates = self._consume_results(retrieved, "Retriever")
         self._validate_search_results(candidates, "Retriever")
         canonical_candidates = self._snapshot_evidence(candidates)
-        selected_candidates = self.relevance_policy.select_relevant(
+        if not canonical_candidates:
+            return self._abstention(question, reason="no_relevant_evidence")
+        risk_selected = self.content_risk_policy.select_safe(
             question,
             self._snapshot_evidence(canonical_candidates),
+            method=selected_method,
+        )
+        risk_results = self._consume_results(risk_selected, "Content risk policy")
+        self._validate_search_results(risk_results, "Content risk policy")
+        safe_candidates = self._rebind_selected_results(
+            canonical_candidates,
+            risk_results,
+            participant="Content risk policy",
+        )
+        if not safe_candidates:
+            return self._abstention(question, reason="content_risk")
+        selected_candidates = self.relevance_policy.select_relevant(
+            question,
+            self._snapshot_evidence(safe_candidates),
             method=selected_method,
         )
         policy_results = self._consume_results(
@@ -126,7 +159,7 @@ class RAGService:
         )
         self._validate_search_results(policy_results, "Relevance policy")
         relevant_candidates = self._rebind_selected_results(
-            canonical_candidates, policy_results
+            safe_candidates, policy_results
         )
         if not relevant_candidates:
             return self._abstention(
@@ -293,19 +326,21 @@ class RAGService:
     def _rebind_selected_results(
         candidates: Sequence[SearchResult],
         selected: Sequence[SearchResult],
+        *,
+        participant: str = "Relevance policy",
     ) -> Tuple[SearchResult, ...]:
         remaining = list(candidates)
         rebound = []
         for result in selected:
             if not isinstance(result, SearchResult):
                 raise ComponentContractError(
-                    "Relevance policy must return SearchResult instances."
+                    "{} must return SearchResult instances.".format(participant)
                 )
             try:
                 selected_chunk = RAGService._snapshot_chunk(result.chunk)
             except (TypeError, ValueError) as exc:
                 raise ComponentContractError(
-                    "Relevance policy returned a malformed chunk."
+                    "{} returned a malformed chunk.".format(participant)
                 ) from exc
             for index, candidate in enumerate(remaining):
                 if (
@@ -317,8 +352,8 @@ class RAGService:
                     break
             else:
                 raise ComponentContractError(
-                    "Relevance policy may only filter or reorder its unchanged "
-                    "candidate evidence."
+                    "{} may only filter or reorder its unchanged candidate "
+                    "evidence.".format(participant)
                 )
         return tuple(rebound)
 
