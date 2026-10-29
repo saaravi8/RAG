@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 
+_PRE_GENERATION_ABSTENTION_REASONS = frozenset(
+    {"no_relevant_evidence", "no_reranked_evidence", "content_risk"}
+)
+
+
 @dataclass(frozen=True)
 class EvaluationCase:
     """Expected relevant document IDs for one evaluation question."""
@@ -132,6 +137,23 @@ class EvaluationObservation:
             raise ValueError(
                 "A 'verification_error' abstention requires verification_status='error'."
             )
+        if reason in _PRE_GENERATION_ABSTENTION_REASONS:
+            if not self.abstained or generated or verification_status != "not_checked":
+                raise ValueError(
+                    "A {!r} abstention must occur before answer generation and "
+                    "verification.".format(reason)
+                )
+        if reason == "unsupported_answer":
+            if (
+                not self.abstained
+                or not generated
+                or verification_status != "checked"
+                or self.answer_supported is not False
+            ):
+                raise ValueError(
+                    "An 'unsupported_answer' abstention must preserve one generated, "
+                    "checked, unsupported answer."
+                )
         if self.abstained and verification_status == "checked":
             if self.answer_supported is not False:
                 raise ValueError("An abstained checked answer must be unsupported.")

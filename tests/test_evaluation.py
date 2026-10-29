@@ -431,6 +431,49 @@ class EvaluationHarnessTests(unittest.TestCase):
         self.assertEqual(report.post_generation_abstention_count, 2)
         self.assertEqual(report.verification_error_count, 1)
 
+    def test_reserved_abstention_reasons_fix_their_pipeline_phase(self):
+        """Deterministic contract: one invalid state per reserved reason proves service-owned reasons cannot contradict generation or verification, while two custom reasons preserve explicit phase selection."""
+
+        with self.assertRaisesRegex(ValueError, "unsupported_answer"):
+            EvaluationObservation(
+                "unsupported",
+                ("doc",),
+                True,
+                abstention_reason="unsupported_answer",
+            )
+        for reason in (
+            "no_relevant_evidence",
+            "no_reranked_evidence",
+            "content_risk",
+        ):
+            with self.subTest(reason=reason):
+                with self.assertRaisesRegex(ValueError, "before answer generation"):
+                    EvaluationObservation(
+                        reason,
+                        (),
+                        True,
+                        abstention_reason=reason,
+                        answer_generated=True,
+                    )
+
+        custom_pre_generation = EvaluationObservation(
+            "custom-pre",
+            (),
+            True,
+            abstention_reason="application_policy",
+        )
+        custom_post_generation = EvaluationObservation(
+            "custom-post",
+            ("doc",),
+            True,
+            abstention_reason="application_policy",
+            answer_generated=True,
+        )
+
+        self.assertFalse(custom_pre_generation.answer_generated)
+        self.assertTrue(custom_post_generation.answer_generated)
+        self.assertEqual(custom_post_generation.verification_status, "not_checked")
+
     def test_unsupported_generation_is_measured_end_to_end(self):
         """A retrieved answer can be relevant while its generated text is unsupported."""
 
