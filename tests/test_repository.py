@@ -118,8 +118,77 @@ class RepositoryPolicyTests(unittest.TestCase):
                 with self.assertRaises(error):
                     RepositoryLimits(max_files=value)
 
+    def test_policy_flags_require_exact_booleans(self):
+        """Contract: truthy impostors cannot enable excluded content."""
+
+        for field_name in (
+            "include_generated",
+            "include_lockfiles",
+            "include_unknown_text",
+        ):
+            for value in (1, "false", None):
+                with self.subTest(field=field_name, value=value):
+                    with self.assertRaises(TypeError):
+                        RepositoryPolicy(**{field_name: value})
+
+        self.assertFalse(RepositoryPolicy().include_generated)
+
 
 class RepositoryIndexerTests(RepositoryFixture):
+    def test_directory_identity_change_after_discovery_fails_closed(self):
+        """Security regression: one approved root identity governs the full scan."""
+
+        self.write("safe.txt", "approved content\n")
+        original_discover = repository_module._RepositoryDiscovery.discover
+        saved = Path(self.temporary_directory.name) / "saved-repository"
+        replacement = Path(self.temporary_directory.name) / "replacement"
+        replacement.mkdir()
+        (replacement / "safe.txt").write_text(
+            "replacement content\n", encoding="utf-8"
+        )
+        application = build_demo_rag()
+
+        def replace_after_discovery(discovery):
+            result = original_discover(discovery)
+            self.root.rename(saved)
+            replacement.rename(self.root)
+            return result
+
+        try:
+            with mock.patch.object(
+                repository_module._RepositoryDiscovery,
+                "discover",
+                autospec=True,
+                side_effect=replace_after_discovery,
+            ):
+                with self.assertRaises(UnsafeRepositoryError):
+                    application.index_repository(
+                        self.root, repository_id="example"
+                    )
+        finally:
+            if self.root.exists():
+                self.root.rename(replacement)
+            if saved.exists():
+                saved.rename(self.root)
+
+        self.assertEqual(application.store.count, 0)
+        self.assertEqual(
+            application.repository_indexer.manifest.entries("example"), {}
+        )
+
+    def test_root_descriptor_is_closed_after_identity_check(self):
+        """Resource regression: identity checks release their directory handle."""
+
+        repository = repository_module._SafeRepository(self.root)
+        with mock.patch.object(
+            repository_module.os,
+            "close",
+            wraps=repository_module.os.close,
+        ) as close:
+            repository.assert_current_identity()
+
+        self.assertEqual(close.call_count, 1)
+
     def test_discovery_limit_counts_ignored_entries_and_bounds_diagnostics(self):
         """Ignored files cannot bypass the traversal or diagnostic caps."""
 
@@ -486,6 +555,46 @@ class RepositoryIndexerTests(RepositoryFixture):
             self.skipTest("directory symlinks are unavailable")
         with self.assertRaises(UnsafeRepositoryError):
             indexer.index_repository(link, repository_id="x")
+
+    def test_root_path_indirection_after_discovery_fails_closed(self):
+        """Security regression: a changed root path cannot redirect file reads."""
+
+        self.write("safe.txt", "approved content\n")
+        original_discover = repository_module._RepositoryDiscovery.discover
+        saved = Path(self.temporary_directory.name) / "saved-repository"
+        alternate = Path(self.temporary_directory.name) / "alternate"
+        alternate.mkdir()
+        (alternate / "safe.txt").write_text(
+            "alternate content\n", encoding="utf-8"
+        )
+        application = build_demo_rag()
+
+        def redirect_after_discovery(discovery):
+            result = original_discover(discovery)
+            self.root.rename(saved)
+            self.root.symlink_to(alternate, target_is_directory=True)
+            return result
+
+        try:
+            with mock.patch.object(
+                repository_module._RepositoryDiscovery,
+                "discover",
+                autospec=True,
+                side_effect=redirect_after_discovery,
+            ):
+                with self.assertRaises(UnsafeRepositoryError):
+                    application.index_repository(
+                        self.root, repository_id="example"
+                    )
+        except (OSError, NotImplementedError):
+            self.skipTest("directory symlinks are unavailable")
+        finally:
+            if self.root.is_symlink():
+                self.root.unlink()
+            if saved.exists():
+                saved.rename(self.root)
+
+        self.assertEqual(application.store.count, 0)
 
     def test_repository_ids_are_validated_before_files_are_read(self):
         """Stable document identity accepts a small explicit character set only."""
@@ -1293,6 +1402,95 @@ class FactoryCompatibilityTests(unittest.TestCase):
         self.assertIsInstance(report, RepositoryIndexReport)
         self.assertEqual(report.failed, 1)
         self.assertIn("processing_failed", {issue.code for issue in report.failures})
+
+    def test_malformed_secret_scan_fields_fail_before_publication(self):
+        """Security contract: malformed diagnostics cannot commit indexed state."""
+
+        def forged_result(text="sanitized", count=0, categories=()):
+            result = object.__new__(SecretScanResult)
+            object.__setattr__(result, "text", text)
+            object.__setattr__(result, "redaction_count", count)
+            object.__setattr__(result, "categories", categories)
+            return result
+
+        invalid_results = (
+            forged_result(text=7),
+            forged_result(count=True),
+            forged_result(count=-1),
+            forged_result(categories=["credential"]),
+            forged_result(categories=("",)),
+            forged_result(categories=("x" * 513,)),
+        )
+
+        for invalid_result in invalid_results:
+            with self.subTest(result=invalid_result):
+                class BadScanner:
+                    def rejects_path(self, relative_path):
+                        del relative_path
+                        return False
+
+                    def scan(self, text):
+                        del text
+                        return invalid_result
+
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory) / "repository"
+                    (root / ".git").mkdir(parents=True)
+                    (root / ".git" / "HEAD").write_text(
+                        "{}\n".format("b" * 40), encoding="ascii"
+                    )
+                    (root / "safe.txt").write_text(
+                        "safe text", encoding="utf-8"
+                    )
+                    application = build_demo_rag()
+                    application.repository_indexer.secret_scanner = BadScanner()
+
+                    report = application.index_repository(
+                        root, repository_id="example"
+                    )
+
+                    self.assertEqual(report.failed, 1)
+                    self.assertEqual(application.store.count, 0)
+                    self.assertEqual(
+                        application.repository_indexer.manifest.entries("example"),
+                        {},
+                    )
+
+    def test_expanding_scanner_output_is_bounded_before_publication(self):
+        """Resource contract: transformed text retains the raw-file byte bound."""
+
+        class ExpandingScanner:
+            def rejects_path(self, relative_path):
+                del relative_path
+                return False
+
+            def scan(self, text):
+                del text
+                return SecretScanResult("x" * 17, 0, ())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repository"
+            (root / ".git").mkdir(parents=True)
+            (root / ".git" / "HEAD").write_text(
+                "{}\n".format("b" * 40), encoding="ascii"
+            )
+            (root / "safe.txt").write_text("x", encoding="utf-8")
+            application = build_demo_rag()
+            application.repository_indexer.secret_scanner = ExpandingScanner()
+            policy = RepositoryPolicy(
+                limits=RepositoryLimits(max_file_bytes=16)
+            )
+
+            report = application.index_repository(
+                root, repository_id="example", policy=policy
+            )
+
+        self.assertEqual(report.indexed, 0)
+        self.assertEqual(application.store.count, 0)
+        self.assertIn(
+            "transformed_file_too_large",
+            {issue.code for issue in report.skips},
+        )
 
 
 if __name__ == "__main__":

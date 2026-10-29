@@ -191,6 +191,17 @@ class RepositoryPolicy:
     include_lockfiles: bool = False
     include_unknown_text: bool = False
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.limits, RepositoryLimits):
+            raise TypeError("limits must be a RepositoryLimits instance.")
+        for name in (
+            "include_generated",
+            "include_lockfiles",
+            "include_unknown_text",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError("{} must be a boolean.".format(name))
+
 
 @dataclass(frozen=True)
 class RepositoryIssue:
@@ -705,6 +716,31 @@ class SecretScanResult:
     redaction_count: int
     categories: Tuple[str, ...]
 
+    def __post_init__(self) -> None:
+        if type(self.text) is not str:
+            raise TypeError("SecretScanResult.text must be a string.")
+        if type(self.redaction_count) is not int:
+            raise TypeError("SecretScanResult.redaction_count must be an integer.")
+        if self.redaction_count < 0:
+            raise ValueError("SecretScanResult.redaction_count cannot be negative.")
+        if isinstance(self.categories, (str, bytes, bytearray)):
+            raise TypeError("SecretScanResult.categories must be a sequence.")
+        try:
+            categories = tuple(self.categories)
+        except TypeError as exc:
+            raise TypeError(
+                "SecretScanResult.categories must be a sequence."
+            ) from exc
+        if any(type(category) is not str for category in categories):
+            raise TypeError(
+                "SecretScanResult.categories must contain only strings."
+            )
+        if any(not category.strip() for category in categories):
+            raise ValueError(
+                "SecretScanResult.categories must contain nonempty strings."
+            )
+        object.__setattr__(self, "categories", categories)
+
 
 class SecretScanner(Protocol):
     """Replaceable boundary for sensitive paths and content redaction."""
@@ -877,6 +913,8 @@ class _SafeRepository:
                 "Linked Git directories and alternate worktree layouts are unsupported."
             )
         self.root = root
+        self._root_identity = (root_stat.st_dev, root_stat.st_ino)
+        self.assert_current_identity()
 
     def absolute(self, relative_path: str) -> Path:
         parts = self._parts(relative_path)
@@ -891,7 +929,7 @@ class _SafeRepository:
         cloexec = getattr(os, "O_CLOEXEC", 0)
         opened: List[int] = []
         try:
-            current = os.open(str(self.root), os.O_RDONLY | directory | cloexec)
+            current = self._open_root()
             opened.append(current)
             for component in parts[:-1]:
                 current = os.open(
@@ -923,8 +961,12 @@ class _SafeRepository:
             return data
         except (UnsafeRepositoryError, RepositoryResourceLimitError):
             raise
-        except (OSError, TypeError, NotImplementedError) as exc:
+        except (TypeError, NotImplementedError) as exc:
             return self._fallback_read(relative_path, max_bytes, exc)
+        except OSError as exc:
+            raise UnsafeRepositoryError(
+                "Repository file could not be read safely."
+            ) from exc
         finally:
             for descriptor in reversed(opened):
                 try:
@@ -935,6 +977,7 @@ class _SafeRepository:
     def _fallback_read(
         self, relative_path: str, max_bytes: int, original: Exception
     ) -> bytes:
+        self.assert_current_identity()
         target = self.absolute(relative_path)
         try:
             before = target.lstat()
@@ -954,6 +997,7 @@ class _SafeRepository:
                 raise UnsafeRepositoryError(
                     "Repository entry changed while being read."
                 )
+            self.assert_current_identity()
             if len(data) > max_bytes:
                 raise RepositoryResourceLimitError("Repository file exceeds its limit.")
             return data
@@ -963,6 +1007,37 @@ class _SafeRepository:
             raise UnsafeRepositoryError(
                 "Repository file could not be read safely."
             ) from (exc or original)
+
+    def _open_root(self) -> int:
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory = getattr(os, "O_DIRECTORY", 0)
+        cloexec = getattr(os, "O_CLOEXEC", 0)
+        try:
+            descriptor = os.open(
+                str(self.root),
+                os.O_RDONLY | directory | nofollow | cloexec,
+            )
+        except (OSError, TypeError, NotImplementedError) as exc:
+            raise UnsafeRepositoryError(
+                "Repository root identity changed or is unavailable."
+            ) from exc
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISDIR(info.st_mode) or (
+                info.st_dev,
+                info.st_ino,
+            ) != self._root_identity:
+                raise UnsafeRepositoryError(
+                    "Repository root identity changed during indexing."
+                )
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def assert_current_identity(self) -> None:
+        descriptor = self._open_root()
+        os.close(descriptor)
 
     @staticmethod
     def _parts(relative_path: str) -> Tuple[str, ...]:
@@ -1291,6 +1366,7 @@ class RepositoryIndexer:
         discovery = _RepositoryDiscovery(
             repository, selected, diagnostics
         ).discover()
+        repository.assert_current_identity()
         try:
             previous = _validate_manifest_snapshot(
                 repository_id,
@@ -1405,10 +1481,22 @@ class RepositoryIndexer:
                     diagnostics.add_skip(relative, "generated")
                     continue
                 secret_result = self.secret_scanner.scan(text)
-                if not isinstance(secret_result, SecretScanResult):
-                    raise TypeError("Secret scanner returned an invalid result.")
+                secret_result = self._validate_secret_scan_result(
+                    secret_result,
+                    max_category_length=selected.limits.max_metadata_length,
+                )
                 if not secret_result.text.strip():
                     diagnostics.add_skip(relative, "empty")
+                    continue
+                if len(secret_result.text.encode("utf-8")) > (
+                    selected.limits.max_file_bytes
+                ):
+                    diagnostics.add_skip(relative, "transformed_file_too_large")
+                    continue
+                if secret_result.text.count("\n") + 1 > (
+                    selected.limits.max_lines_per_file
+                ):
+                    diagnostics.add_skip(relative, "line_limit")
                     continue
 
                 injection_suspected = bool(_PROMPT_INJECTION.search(secret_result.text))
@@ -1431,6 +1519,16 @@ class RepositoryIndexer:
                 document = self._document(
                     secret_result.text, classification, relative, metadata
                 )
+                if len(document.text.encode("utf-8")) > (
+                    selected.limits.max_file_bytes
+                ):
+                    diagnostics.add_skip(relative, "transformed_file_too_large")
+                    continue
+                if document.text.count("\n") + 1 > (
+                    selected.limits.max_lines_per_file
+                ):
+                    diagnostics.add_skip(relative, "line_limit")
+                    continue
                 remaining_chunks = selected.limits.max_total_chunks - total_chunks
                 if remaining_chunks <= 0:
                     complete = False
@@ -1490,6 +1588,8 @@ class RepositoryIndexer:
                 retained[relative] = manifest_entry
             except RepositoryResourceLimitError:
                 diagnostics.add_skip(relative, "chunk_limit")
+            except UnsafeRepositoryError:
+                raise
             except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception as exc:
@@ -1699,6 +1799,31 @@ class RepositoryIndexer:
                 canonical_metadata,
             )
         return Document(text, classification.document_type, metadata)
+
+    @staticmethod
+    def _validate_secret_scan_result(
+        result: Any,
+        *,
+        max_category_length: int,
+    ) -> SecretScanResult:
+        if not isinstance(result, SecretScanResult):
+            raise TypeError("Secret scanner returned an invalid result.")
+        if type(result.text) is not str:
+            raise TypeError("Secret scanner returned invalid text.")
+        if type(result.redaction_count) is not int:
+            raise TypeError("Secret scanner returned an invalid redaction count.")
+        if result.redaction_count < 0:
+            raise ValueError("Secret scanner returned a negative redaction count.")
+        if type(result.categories) is not tuple:
+            raise TypeError("Secret scanner returned invalid categories.")
+        for category in result.categories:
+            if type(category) is not str:
+                raise TypeError("Secret scanner categories must be strings.")
+            if not category.strip():
+                raise ValueError("Secret scanner categories cannot be empty.")
+            if len(category) > max_category_length:
+                raise ValueError("Secret scanner category exceeds its limit.")
+        return result
 
     @staticmethod
     def _classify(
