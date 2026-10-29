@@ -874,6 +874,16 @@ class _DiscoveryResult:
     complete: bool
 
 
+@dataclass(frozen=True)
+class _DirectoryEntry:
+    name: str
+    info: os.stat_result
+
+
+class _RepositoryRootIdentityError(UnsafeRepositoryError):
+    """The approved repository root is no longer the opened directory."""
+
+
 class _SafeRepository:
     """Validate a local root and read relative regular files without symlinks."""
 
@@ -961,9 +971,7 @@ class _SafeRepository:
             return data
         except (UnsafeRepositoryError, RepositoryResourceLimitError):
             raise
-        except (TypeError, NotImplementedError) as exc:
-            return self._fallback_read(relative_path, max_bytes, exc)
-        except OSError as exc:
+        except (OSError, TypeError, NotImplementedError) as exc:
             raise UnsafeRepositoryError(
                 "Repository file could not be read safely."
             ) from exc
@@ -974,39 +982,83 @@ class _SafeRepository:
                 except OSError:
                     pass
 
-    def _fallback_read(
-        self, relative_path: str, max_bytes: int, original: Exception
-    ) -> bytes:
-        self.assert_current_identity()
-        target = self.absolute(relative_path)
+    def directory_entries(
+        self,
+        relative_directory: str,
+        *,
+        max_entries: int,
+    ) -> Tuple[_DirectoryEntry, ...]:
+        parts = () if not relative_directory else self._parts(relative_directory)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory = getattr(os, "O_DIRECTORY", 0)
+        cloexec = getattr(os, "O_CLOEXEC", 0)
+        opened: List[int] = []
         try:
-            before = target.lstat()
-            if target.is_symlink() or not stat.S_ISREG(before.st_mode):
-                raise UnsafeRepositoryError("Repository entry is not a regular file.")
-            resolved = target.resolve(strict=True)
-            if os.path.commonpath((str(self.root), str(resolved))) != str(self.root):
-                raise UnsafeRepositoryError(
-                    "Repository path escapes the approved root."
+            current = self._open_root()
+            opened.append(current)
+            for component in parts:
+                current = os.open(
+                    component,
+                    os.O_RDONLY | directory | nofollow | cloexec,
+                    dir_fd=current,
                 )
-            if before.st_size > max_bytes:
-                raise RepositoryResourceLimitError("Repository file exceeds its limit.")
-            with resolved.open("rb") as handle:
-                data = handle.read(max_bytes + 1)
-            after = target.lstat()
-            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-                raise UnsafeRepositoryError(
-                    "Repository entry changed while being read."
-                )
-            self.assert_current_identity()
-            if len(data) > max_bytes:
-                raise RepositoryResourceLimitError("Repository file exceeds its limit.")
-            return data
-        except (UnsafeRepositoryError, RepositoryResourceLimitError):
+                opened.append(current)
+            entries = []
+            with os.scandir(current) as iterator:
+                for entry in iterator:
+                    entries.append(
+                        _DirectoryEntry(
+                            entry.name,
+                            entry.stat(follow_symlinks=False),
+                        )
+                    )
+                    if len(entries) >= max_entries:
+                        break
+            return tuple(entries)
+        except _RepositoryRootIdentityError:
             raise
-        except OSError as exc:
+        except (OSError, TypeError, NotImplementedError) as exc:
             raise UnsafeRepositoryError(
-                "Repository file could not be read safely."
-            ) from (exc or original)
+                "Repository directory could not be inspected safely."
+            ) from exc
+        finally:
+            for descriptor in reversed(opened):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def stat_entry(self, relative_path: str) -> os.stat_result:
+        parts = self._parts(relative_path)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory = getattr(os, "O_DIRECTORY", 0)
+        cloexec = getattr(os, "O_CLOEXEC", 0)
+        opened: List[int] = []
+        try:
+            current = self._open_root()
+            opened.append(current)
+            for component in parts[:-1]:
+                current = os.open(
+                    component,
+                    os.O_RDONLY | directory | nofollow | cloexec,
+                    dir_fd=current,
+                )
+                opened.append(current)
+            return os.stat(parts[-1], dir_fd=current, follow_symlinks=False)
+        except _RepositoryRootIdentityError:
+            raise
+        except FileNotFoundError:
+            raise
+        except (OSError, TypeError, NotImplementedError) as exc:
+            raise UnsafeRepositoryError(
+                "Repository entry could not be inspected safely."
+            ) from exc
+        finally:
+            for descriptor in reversed(opened):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
     def _open_root(self) -> int:
         nofollow = getattr(os, "O_NOFOLLOW", 0)
@@ -1018,7 +1070,7 @@ class _SafeRepository:
                 os.O_RDONLY | directory | nofollow | cloexec,
             )
         except (OSError, TypeError, NotImplementedError) as exc:
-            raise UnsafeRepositoryError(
+            raise _RepositoryRootIdentityError(
                 "Repository root identity changed or is unavailable."
             ) from exc
         try:
@@ -1027,7 +1079,7 @@ class _SafeRepository:
                 info.st_dev,
                 info.st_ino,
             ) != self._root_identity:
-                raise UnsafeRepositoryError(
+                raise _RepositoryRootIdentityError(
                     "Repository root identity changed during indexing."
                 )
             return descriptor
@@ -1064,6 +1116,8 @@ class _SafeRepository:
                 value = self.read_bytes(".git/{}".format(reference), 4_096)
                 sha = value.decode("ascii").strip()
                 return sha.lower() if re.fullmatch(r"[0-9a-fA-F]{40,64}", sha) else None
+            except _RepositoryRootIdentityError:
+                raise
             except (RepositoryIngestionError, UnicodeDecodeError):
                 packed = self.read_bytes(".git/packed-refs", 1_000_000)
                 for line in packed.decode("ascii", errors="ignore").splitlines():
@@ -1071,6 +1125,8 @@ class _SafeRepository:
                         sha = line.split(" ", 1)[0]
                         if re.fullmatch(r"[0-9a-fA-F]{40,64}", sha):
                             return sha.lower()
+        except _RepositoryRootIdentityError:
+            raise
         except (RepositoryIngestionError, UnicodeDecodeError):
             return None
         return None
@@ -1141,29 +1197,33 @@ class _RepositoryDiscovery:
             )
             return
 
-        absolute = (
-            self.repository.root
-            if not relative_directory
-            else self.repository.absolute(relative_directory)
-        )
         if not self._load_ignore_rules(relative_directory):
             return
 
         entries = []
         hit_entry_limit = False
         try:
-            with os.scandir(absolute) as iterator:
-                for entry in iterator:
-                    if (
-                        self.visited_entries
-                        >= self.policy.limits.max_discovered_entries
-                    ):
-                        hit_entry_limit = True
-                        break
-                    self.visited_entries += 1
-                    entries.append(entry)
+            remaining_entries = (
+                self.policy.limits.max_discovered_entries
+                - self.visited_entries
+                + 1
+            )
+            for entry in self.repository.directory_entries(
+                relative_directory,
+                max_entries=remaining_entries,
+            ):
+                if (
+                    self.visited_entries
+                    >= self.policy.limits.max_discovered_entries
+                ):
+                    hit_entry_limit = True
+                    break
+                self.visited_entries += 1
+                entries.append(entry)
             entries.sort(key=lambda item: item.name)
-        except OSError:
+        except _RepositoryRootIdentityError:
+            raise
+        except (OSError, UnsafeRepositoryError):
             self.complete = False
             self.diagnostics.add_skip(
                 relative_directory, "directory_unreadable"
@@ -1174,12 +1234,7 @@ class _RepositoryDiscovery:
             if not self.complete:
                 break
             relative = self._join(relative_directory, entry.name)
-            try:
-                info = entry.stat(follow_symlinks=False)
-            except OSError:
-                self.complete = False
-                self.diagnostics.add_skip(relative, "entry_unreadable")
-                continue
+            info = entry.info
             if stat.S_ISLNK(info.st_mode):
                 self.diagnostics.add_skip(relative, "symlink")
                 continue
@@ -1216,12 +1271,13 @@ class _RepositoryDiscovery:
 
     def _load_ignore_rules(self, relative_directory: str) -> bool:
         relative_ignore = self._join(relative_directory, ".gitignore")
-        target = self.repository.absolute(relative_ignore)
         try:
-            info = target.lstat()
+            info = self.repository.stat_entry(relative_ignore)
         except FileNotFoundError:
             return True
-        except OSError:
+        except _RepositoryRootIdentityError:
+            raise
+        except (OSError, UnsafeRepositoryError):
             self.complete = False
             self.diagnostics.add_skip(relative_ignore, "gitignore_unreadable")
             return False
@@ -1231,6 +1287,8 @@ class _RepositoryDiscovery:
             raw = self.repository.read_bytes(
                 relative_ignore, self.policy.limits.max_ignore_file_bytes
             )
+        except _RepositoryRootIdentityError:
+            raise
         except (OSError, RepositoryIngestionError):
             self.complete = False
             self.diagnostics.add_skip(relative_ignore, "gitignore_unreadable")
@@ -1242,12 +1300,16 @@ class _RepositoryDiscovery:
         return True
 
     def _contains_git_marker(self, relative_directory: str) -> bool:
-        marker = self.repository.absolute(relative_directory) / ".git"
+        marker = self._join(relative_directory, ".git")
         try:
-            marker.lstat()
+            self.repository.stat_entry(marker)
             return True
-        except OSError:
+        except FileNotFoundError:
             return False
+        except _RepositoryRootIdentityError:
+            raise
+        except (OSError, UnsafeRepositoryError):
+            return True
 
     @staticmethod
     def _join(parent: str, name: str) -> str:
@@ -1588,16 +1650,21 @@ class RepositoryIndexer:
                 retained[relative] = manifest_entry
             except RepositoryResourceLimitError:
                 diagnostics.add_skip(relative, "chunk_limit")
-            except UnsafeRepositoryError:
+            except _RepositoryRootIdentityError:
                 raise
+            except UnsafeRepositoryError:
+                failed_paths.add(relative)
+                diagnostics.add_failure(relative, "processing_failed")
+                complete = False
             except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception as exc:
                 del exc
                 failed_paths.add(relative)
                 diagnostics.add_failure(relative, "processing_failed")
+                complete = False
 
-        current_manifest = self._finish_manifest(
+        current_manifest, complete = self._finish_manifest(
             repository_id,
             previous,
             current_manifest,
@@ -1605,6 +1672,7 @@ class RepositoryIndexer:
             failed_paths,
             complete,
             diagnostics,
+            max_errors=selected.limits.max_errors,
         )
         deleted = sum(
             1
@@ -1639,7 +1707,9 @@ class RepositoryIndexer:
         failed_paths: set,
         complete: bool,
         diagnostics: _BoundedDiagnostics,
-    ) -> Mapping[str, RepositoryManifestEntry]:
+        *,
+        max_errors: int,
+    ) -> Tuple[Mapping[str, RepositoryManifestEntry], bool]:
         desired = dict(current_manifest)
         if complete:
             stale = sorted(
@@ -1647,7 +1717,12 @@ class RepositoryIndexer:
                 for path in previous
                 if path not in retained and path not in failed_paths
             )
-            for path in stale:
+            for position, path in enumerate(stale):
+                if diagnostics.failed_count >= max_errors:
+                    complete = False
+                    diagnostics.add_skipped_count(len(stale) - position - 1)
+                    diagnostics.add_skip(path, "maximum_errors", terminal=True)
+                    break
                 try:
                     self.indexer.delete(
                         previous[path].document_id,
@@ -1665,7 +1740,8 @@ class RepositoryIndexer:
                 except Exception as exc:
                     del exc
                     diagnostics.add_failure(path, "stale_delete_failed")
-        return desired
+                    complete = False
+        return desired, complete
 
     def _prepare_manifest_snapshot(
         self,

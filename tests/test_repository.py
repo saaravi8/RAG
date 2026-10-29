@@ -236,7 +236,7 @@ class RepositoryIndexerTests(RepositoryFixture):
         original_scandir = os.scandir
 
         def controlled_scandir(path):
-            if Path(path) != self.root.resolve():
+            if not isinstance(path, int) and Path(path) != self.root.resolve():
                 return original_scandir(path)
 
             @contextmanager
@@ -272,12 +272,82 @@ class RepositoryIndexerTests(RepositoryFixture):
             "maximum_discovered_entries", {issue.code for issue in report.skips}
         )
 
+    def test_discovery_uses_the_approved_directory_during_transient_path_change(self):
+        """Security regression: inventory is descriptor-bound, not pathname-bound."""
+
+        self.write("approved.txt", "approved content\n")
+        saved = Path(self.temporary_directory.name) / "saved-repository"
+        replacement = Path(self.temporary_directory.name) / "replacement"
+        replacement.mkdir()
+        (replacement / "replacement.txt").write_text(
+            "replacement content\n", encoding="utf-8"
+        )
+        original_scandir = os.scandir
+        changed = False
+
+        @contextmanager
+        def transient_entries(descriptor):
+            nonlocal changed
+            self.root.rename(saved)
+            replacement.rename(self.root)
+            try:
+                with original_scandir(descriptor) as iterator:
+                    entries = tuple(iterator)
+            finally:
+                self.root.rename(replacement)
+                saved.rename(self.root)
+            changed = True
+            yield iter(entries)
+
+        def controlled_scandir(path):
+            if isinstance(path, int) and not changed:
+                return transient_entries(path)
+            return original_scandir(path)
+
+        with mock.patch.object(
+            repository_module.os, "scandir", side_effect=controlled_scandir
+        ):
+            application = build_demo_rag()
+            report = application.index_repository(
+                self.root, repository_id="example"
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual(report.indexed, 1)
+        paths = {
+            result.chunk.metadata["relative_path"]
+            for result in application.store.search(
+                application.indexer.embedder.embed_query("content"), top_k=10
+            )
+        }
+        self.assertEqual(paths, {"approved.txt"})
+
+    def test_unavailable_descriptor_scanning_fails_closed(self):
+        """Security regression: no pathname fallback replaces secure traversal."""
+
+        self.write("safe.txt", "safe content\n")
+        with mock.patch.object(
+            repository_module.os,
+            "scandir",
+            side_effect=NotImplementedError("descriptor scanning unavailable"),
+        ):
+            application = build_demo_rag()
+            report = application.index_repository(
+                self.root, repository_id="example"
+            )
+
+        self.assertFalse(report.complete)
+        self.assertEqual(report.indexed, 0)
+        self.assertEqual(application.store.count, 0)
+        self.assertIn(
+            "directory_unreadable", {issue.code for issue in report.skips}
+        )
+
     def test_symlink_special_and_unreadable_entries_have_bounded_diagnostics(self):
         """Non-regular and unreadable entries are counted without permission tricks."""
 
         unreadable = self.root / "unreadable"
         unreadable.mkdir()
-        unreadable = unreadable.resolve()
         target = self.write("target.txt", "safe\n")
         link = self.root / "linked.txt"
         fifo = self.root / "events.pipe"
@@ -286,16 +356,23 @@ class RepositoryIndexerTests(RepositoryFixture):
             os.mkfifo(fifo)
         except (AttributeError, NotImplementedError, OSError):
             self.skipTest("symlinks or FIFOs are unavailable")
-        original_scandir = os.scandir
+        original_entries = repository_module._SafeRepository.directory_entries
 
-        def controlled_scandir(path):
-            if Path(path) == unreadable:
-                raise PermissionError("injected unreadable directory")
-            return original_scandir(path)
+        def controlled_entries(repository, relative_directory, *, max_entries):
+            if relative_directory == "unreadable":
+                raise UnsafeRepositoryError("injected unreadable directory")
+            return original_entries(
+                repository,
+                relative_directory,
+                max_entries=max_entries,
+            )
 
         policy = RepositoryPolicy(limits=RepositoryLimits(max_issues=2))
         with mock.patch.object(
-            repository_module.os, "scandir", side_effect=controlled_scandir
+            repository_module._SafeRepository,
+            "directory_entries",
+            autospec=True,
+            side_effect=controlled_entries,
         ):
             report = build_demo_rag().index_repository(
                 self.root, repository_id="example", policy=policy
@@ -540,6 +617,32 @@ class RepositoryIndexerTests(RepositoryFixture):
         self.assertFalse(report.complete)
         self.assertEqual(report.indexed, 0)
         self.assertIn("total_bytes_limit", {issue.code for issue in report.skips})
+
+    def test_file_disappearance_is_bounded_and_marks_scan_incomplete(self):
+        """Race regression: an entry failure is reported without aborting the process."""
+
+        self.write("safe.txt", "safe content\n")
+        original_read = repository_module._SafeRepository.read_bytes
+
+        def disappearing_read(repository, relative_path, max_bytes):
+            if relative_path == "safe.txt":
+                raise UnsafeRepositoryError("entry disappeared")
+            return original_read(repository, relative_path, max_bytes)
+
+        with mock.patch.object(
+            repository_module._SafeRepository,
+            "read_bytes",
+            autospec=True,
+            side_effect=disappearing_read,
+        ):
+            application = build_demo_rag()
+            report = application.index_repository(
+                self.root, repository_id="example"
+            )
+
+        self.assertFalse(report.complete)
+        self.assertEqual(report.failed, 1)
+        self.assertEqual(application.store.count, 0)
 
     def test_symlinked_repository_root_and_remote_urls_are_rejected(self):
         """Repository ingestion remains local and refuses ambiguous roots."""
@@ -811,6 +914,7 @@ class ManifestFailureTests(RepositoryFixture):
         report = repository.index_repository(self.root, repository_id="example")
 
         self.assertEqual(report.failed, 1)
+        self.assertFalse(report.complete)
         self.assertEqual(manifest.entries("example")["service.py"], previous)
         self.assertIn("processing_failed", {issue.code for issue in report.failures})
 
@@ -829,8 +933,44 @@ class ManifestFailureTests(RepositoryFixture):
         report = repository.index_repository(self.root, repository_id="example")
 
         self.assertEqual(report.failed, 1)
+        self.assertFalse(report.complete)
         self.assertIn("service.py", manifest.entries("example"))
         self.assertIn("stale_delete_failed", {issue.code for issue in report.failures})
+
+    def test_stale_deletion_stops_at_the_error_budget(self):
+        """Reconciliation regression: deletion failures obey max_errors."""
+
+        paths = tuple(
+            self.write(
+                "file-{}.py".format(index),
+                "def value_{}():\n    return {}\n".format(index, index),
+            )
+            for index in range(3)
+        )
+        recording = self.RecordingIndexer()
+        manifest = InMemoryRepositoryManifest()
+        repository = RepositoryIndexer(recording, manifest=manifest)
+        repository.index_repository(self.root, repository_id="example")
+        entries = manifest.entries("example")
+        recording.fail_deletes.update(
+            entry.document_id for entry in entries.values()
+        )
+        for path in paths:
+            path.unlink()
+
+        policy = RepositoryPolicy(limits=RepositoryLimits(max_errors=1))
+        with mock.patch.object(
+            recording, "delete", wraps=recording.delete
+        ) as delete:
+            report = repository.index_repository(
+                self.root, repository_id="example", policy=policy
+            )
+
+        self.assertFalse(report.complete)
+        self.assertEqual(report.failed, 1)
+        self.assertEqual(delete.call_count, 1)
+        self.assertEqual(set(manifest.entries("example")), set(entries))
+        self.assertIn("maximum_errors", {issue.code for issue in report.skips})
 
     def test_manifest_commit_failure_rolls_back_the_real_vector_store(self):
         """Manifest and vectors retain the same old file after publication fails."""
@@ -874,6 +1014,7 @@ class ManifestFailureTests(RepositoryFixture):
 
         self.assertEqual(report.deleted, 0)
         self.assertEqual(report.failed, 1)
+        self.assertFalse(report.complete)
         self.assertIn("service.py", manifest.entries("example"))
         self.assertTrue(any("service" in result.chunk.text for result in results))
 
