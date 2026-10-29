@@ -1,15 +1,30 @@
 {
+  "schema_version": 1,
+  "dataset_id": "modular-rag-deterministic-contract",
+  "dataset_version": "1.0.0",
+  "provenance": {
+    "origin": "Project-maintained synthetic contract fixture",
+    "judgment_method": "Manually authored document-relevance labels independent of runtime retrieval and answer verification",
+    "intended_use": "Deterministic contract testing only"
+  },
+  "judgment_unit": "document_id",
   "documents": [
     {
       "document_id": "architecture",
+      "language": "mixed",
+      "content_category": "prose",
       "text": "Project Atlas stores application data in PostgreSQL. פרויקט אטלס שומר נתונים במסד PostgreSQL."
     },
     {
       "document_id": "transactions",
+      "language": "mixed",
+      "content_category": "prose",
       "text": "Atomic indexing prepares every participant before commit and rolls back failures. עדכון אטומי מכין את כל האינדקסים לפני commit."
     },
     {
       "document_id": "code-delete",
+      "language": "english",
+      "content_category": "code",
       "text": "def delete_document(document_id): remove every indexed record owned by document_id"
     }
   ],
@@ -17,36 +32,57 @@
     {
       "case_id": "english-database",
       "question": "Where does Project Atlas store application data?",
+      "language": "english",
+      "content_category": "prose",
+      "answerability": "answerable",
       "relevant_document_ids": ["architecture"]
     },
     {
       "case_id": "hebrew-database",
       "question": "איפה פרויקט אטלס שומר נתונים?",
+      "language": "hebrew",
+      "content_category": "prose",
+      "answerability": "answerable",
       "relevant_document_ids": ["architecture"]
     },
     {
       "case_id": "english-atomic",
       "question": "What happens before atomic indexing commit?",
+      "language": "english",
+      "content_category": "prose",
+      "answerability": "answerable",
       "relevant_document_ids": ["transactions"]
     },
     {
       "case_id": "hebrew-atomic",
       "question": "מה מכין עדכון אטומי לפני commit?",
+      "language": "hebrew",
+      "content_category": "prose",
+      "answerability": "answerable",
       "relevant_document_ids": ["transactions"]
     },
     {
       "case_id": "code-delete-function",
       "question": "Which function removes records for a document_id?",
+      "language": "english",
+      "content_category": "code",
+      "answerability": "answerable",
       "relevant_document_ids": ["code-delete"]
     },
     {
       "case_id": "english-unanswerable",
       "question": "Cafeteria menu schedule?",
+      "language": "english",
+      "content_category": "prose",
+      "answerability": "unanswerable",
       "relevant_document_ids": []
     },
     {
       "case_id": "hebrew-unanswerable",
       "question": "מה תחזית מזג האוויר מחר?",
+      "language": "hebrew",
+      "content_category": "prose",
+      "answerability": "unanswerable",
       "relevant_document_ids": []
     }
   ]

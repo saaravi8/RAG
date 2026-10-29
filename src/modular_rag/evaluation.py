@@ -1,4 +1,4 @@
-"""Deterministic retrieval and abstention evaluation primitives."""
+"""Deterministic document-retrieval and answer-safety evaluation primitives."""
 
 import math
 from collections.abc import Sequence
@@ -34,12 +34,23 @@ class EvaluationCase:
 
 @dataclass(frozen=True)
 class EvaluationObservation:
-    """Ranked retrieval and answer outcome observed for one case."""
+    """Ranked document retrieval and answer outcome observed for one case.
+
+    ``answered`` and ``checked`` are deliberately separate concepts. A returned
+    answer may be unchecked when verification is disabled, while a checked
+    answer may be suppressed by an enforcement policy. ``verification_status``
+    is normalized to ``"not_checked"``, ``"checked"``, or ``"error"``.
+    Existing four-argument construction remains valid and infers the status from
+    ``answer_supported``.
+    """
 
     case_id: str
     retrieved_document_ids: Tuple[str, ...]
     abstained: bool
     answer_supported: Optional[bool] = None
+    abstention_reason: Optional[str] = None
+    answer_generated: Optional[bool] = None
+    verification_status: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.case_id, str) or not self.case_id.strip():
@@ -59,17 +70,92 @@ class EvaluationObservation:
             self.answer_supported, bool
         ):
             raise TypeError("answer_supported must be a boolean or None.")
-        if self.abstained and self.answer_supported is not None:
-            raise ValueError("An abstained observation cannot label answer support.")
-        if not self.abstained and self.answer_supported is None:
+
+        reason = self.abstention_reason
+        if reason is not None and not isinstance(reason, str):
+            raise TypeError("abstention_reason must be a string or None.")
+        if isinstance(reason, str) and not reason.strip():
+            raise ValueError("abstention_reason cannot be empty.")
+        if not self.abstained and reason is not None:
             raise ValueError(
-                "A non-abstained observation requires an answer-support label."
+                "A non-abstained observation cannot have an abstention reason."
             )
+
+        generated = self.answer_generated
+        if generated is None:
+            generated = not self.abstained or reason in {
+                "unsupported_answer",
+                "verification_error",
+            }
+        if not isinstance(generated, bool):
+            raise TypeError("answer_generated must be a boolean or None.")
+        if not self.abstained and not generated:
+            raise ValueError("A returned answer must be marked as generated.")
+        if self.abstained and generated and reason is None:
+            raise ValueError(
+                "A post-generation abstention requires an abstention reason."
+            )
+
+        verification_status = self.verification_status
+        if verification_status is None:
+            if reason == "verification_error":
+                verification_status = "error"
+            elif self.answer_supported is not None:
+                verification_status = "checked"
+            else:
+                verification_status = "not_checked"
+        if not isinstance(verification_status, str):
+            raise TypeError("verification_status must be a string or None.")
+        if verification_status not in {"not_checked", "checked", "error"}:
+            raise ValueError(
+                "verification_status must be 'not_checked', 'checked', or 'error'."
+            )
+        if verification_status == "checked" and self.answer_supported is None:
+            raise ValueError("A checked answer requires an answer-support label.")
+        if verification_status != "checked" and self.answer_supported is not None:
+            raise ValueError(
+                "Only a checked answer can carry an answer-support label."
+            )
+        if verification_status == "checked" and not generated:
+            raise ValueError("Only a generated answer can be checked.")
+        if verification_status == "error":
+            if (
+                not self.abstained
+                or not generated
+                or reason != "verification_error"
+            ):
+                raise ValueError(
+                    "A verification error must be a post-generation "
+                    "'verification_error' abstention."
+                )
+        elif reason == "verification_error":
+            raise ValueError(
+                "A 'verification_error' abstention requires verification_status='error'."
+            )
+        if self.abstained and verification_status == "checked":
+            if self.answer_supported is not False:
+                raise ValueError("An abstained checked answer must be unsupported.")
+            if reason != "unsupported_answer":
+                raise ValueError(
+                    "An enforced unsupported answer requires "
+                    "abstention_reason='unsupported_answer'."
+                )
+
         object.__setattr__(self, "retrieved_document_ids", retrieved)
+        object.__setattr__(self, "answer_generated", generated)
+        object.__setattr__(self, "verification_status", verification_status)
 
 
 @dataclass(frozen=True)
 class EvaluationReport:
+    """Aggregate document-retrieval and answer-state metrics.
+
+    ``answered_count`` counts answers returned to callers. ``generated_answer_count``
+    also includes generated answers later suppressed by policy. A checked answer
+    has a valid support verdict, including an enforced unsupported verdict;
+    verifier failures are counted separately and never become support labels.
+    """
+
     case_count: int
     answerable_count: int
     unanswerable_count: int
@@ -81,6 +167,10 @@ class EvaluationReport:
     unsupported_answer_rate: float
     answered_count: int
     checked_answer_count: int
+    generated_answer_count: int = 0
+    pre_generation_abstention_count: int = 0
+    post_generation_abstention_count: int = 0
+    verification_error_count: int = 0
 
 
 def evaluate_observations(
@@ -89,7 +179,7 @@ def evaluate_observations(
     *,
     top_k: int,
 ) -> EvaluationReport:
-    """Calculate retrieval and answer-safety metrics from fixed observations."""
+    """Calculate document-retrieval and answer-safety metrics from observations."""
 
     if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
         raise ValueError("top_k must be a positive integer.")
@@ -110,6 +200,10 @@ def evaluate_observations(
     unanswerable_count = 0
     unsupported_answers = 0
     checked_answers = 0
+    generated_answers = 0
+    pre_generation_abstentions = 0
+    post_generation_abstentions = 0
+    verification_errors = 0
 
     for case_id, case in case_by_id.items():
         observation = observation_by_id[case_id]
@@ -145,10 +239,18 @@ def evaluate_observations(
 
         if observation.abstained:
             predicted_abstentions += 1
-        elif observation.answer_supported is not None:
+            if observation.answer_generated:
+                post_generation_abstentions += 1
+            else:
+                pre_generation_abstentions += 1
+        if observation.answer_generated:
+            generated_answers += 1
+        if observation.verification_status == "checked":
             checked_answers += 1
             if not observation.answer_supported:
                 unsupported_answers += 1
+        elif observation.verification_status == "error":
+            verification_errors += 1
 
     return EvaluationReport(
         case_count=len(case_by_id),
@@ -164,6 +266,10 @@ def evaluate_observations(
             not observation.abstained for observation in observation_by_id.values()
         ),
         checked_answer_count=checked_answers,
+        generated_answer_count=generated_answers,
+        pre_generation_abstention_count=pre_generation_abstentions,
+        post_generation_abstention_count=post_generation_abstentions,
+        verification_error_count=verification_errors,
     )
 
 

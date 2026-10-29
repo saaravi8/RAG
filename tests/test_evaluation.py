@@ -71,6 +71,12 @@ class ExactContextVerifier:
         return VerificationResult(supported, "deterministic exact-context check")
 
 
+class FailingVerifier:
+    def verify(self, question, answer, contexts):
+        del question, answer, contexts
+        raise RuntimeError("fixture verifier unavailable")
+
+
 class EvaluationHarnessTests(unittest.TestCase):
     @staticmethod
     def _fixture():
@@ -128,6 +134,62 @@ class EvaluationHarnessTests(unittest.TestCase):
             [item["question"] for item in cases],
             label="case questions",
         )
+
+    def test_fixture_declares_version_identity_and_judgment_provenance(self):
+        """Dataset contract: one schema/version identity and three provenance fields make the small deterministic fixture traceable without implying production quality."""
+
+        fixture = self._fixture()
+
+        self.assertIs(type(fixture["schema_version"]), int)
+        self.assertEqual(fixture["schema_version"], 1)
+        self.assertEqual(
+            fixture["dataset_id"], "modular-rag-deterministic-contract"
+        )
+        self.assertRegex(fixture["dataset_version"], r"^\d+\.\d+\.\d+$")
+        self.assertEqual(fixture["judgment_unit"], "document_id")
+        provenance = fixture["provenance"]
+        self.assertEqual(
+            set(provenance), {"origin", "judgment_method", "intended_use"}
+        )
+        for value in provenance.values():
+            self.assertIsInstance(value, str)
+            self.assertTrue(value.strip())
+        self.assertIn("independent", provenance["judgment_method"].lower())
+        self.assertIn("contract", provenance["intended_use"].lower())
+
+    def test_fixture_declared_categories_are_complete_and_consistent(self):
+        """Dataset contract: seven cases minimally cover both languages, prose/code, and answerable/unanswerable states while declarations remain consistent with labels and documents."""
+
+        fixture = self._fixture()
+        documents = {
+            item["document_id"]: item for item in fixture["documents"]
+        }
+        cases = fixture["cases"]
+
+        self.assertEqual(
+            {item["language"] for item in cases}, {"english", "hebrew"}
+        )
+        self.assertEqual(
+            {item["content_category"] for item in cases}, {"prose", "code"}
+        )
+        self.assertEqual(
+            {item["answerability"] for item in cases},
+            {"answerable", "unanswerable"},
+        )
+        for document in documents.values():
+            self.assertIn(document["language"], {"english", "mixed"})
+            self.assertIn(document["content_category"], {"prose", "code"})
+        for item in cases:
+            with self.subTest(case_id=item["case_id"]):
+                answerable = item["answerability"] == "answerable"
+                self.assertEqual(bool(item["relevant_document_ids"]), answerable)
+                if item["language"] == "hebrew":
+                    self.assertRegex(item["question"], r"[\u0590-\u05ff]")
+                for document_id in item["relevant_document_ids"]:
+                    self.assertEqual(
+                        documents[document_id]["content_category"],
+                        item["content_category"],
+                    )
 
     def test_fixture_relevant_ids_reference_declared_documents(self):
         """Every relevance judgment points to a document present in the corpus."""
@@ -196,6 +258,178 @@ class EvaluationHarnessTests(unittest.TestCase):
         self.assertEqual(first.abstention_recall, 1.0)
         self.assertEqual(first.unsupported_answer_rate, 0.0)
         self.assertEqual((first.answered_count, first.checked_answer_count), (5, 5))
+        self.assertEqual(first.generated_answer_count, 5)
+        self.assertEqual(first.pre_generation_abstention_count, 2)
+        self.assertEqual(first.post_generation_abstention_count, 0)
+        self.assertEqual(first.verification_error_count, 0)
+
+    def test_unchecked_returned_answer_has_distinct_answered_and_checked_counts(self):
+        """Deterministic integration: one answer with verification disabled is returned and generated but not checked, the smallest case separating the two denominators."""
+
+        fixture = self._fixture()
+        item = fixture["cases"][0]
+        case = EvaluationCase(item["case_id"], item["relevant_document_ids"])
+        service = RAGService(
+            TokenOverlapRetriever(fixture["documents"]),
+            ExtractiveFixtureGenerator(),
+            default_top_k=3,
+        )
+
+        response = service.ask(item["question"], top_k=3)
+        observation = EvaluationObservation(
+            case.case_id,
+            tuple(result.chunk.document_id for result in response.results),
+            response.abstained,
+            answer_supported=None,
+            abstention_reason=response.abstention_reason,
+        )
+        report = evaluate_observations((case,), (observation,), top_k=3)
+
+        self.assertFalse(response.abstained)
+        self.assertIsNone(response.verification)
+        self.assertTrue(observation.answer_generated)
+        self.assertEqual(observation.verification_status, "not_checked")
+        self.assertEqual(
+            (report.answered_count, report.generated_answer_count), (1, 1)
+        )
+        self.assertEqual(report.checked_answer_count, 0)
+        self.assertEqual(report.unsupported_answer_rate, 0.0)
+
+    def test_enforced_unsupported_generation_retains_its_verifier_outcome(self):
+        """Deterministic integration: one enforced negative verdict becomes a post-generation abstention while remaining one checked unsupported generation and zero returned answers."""
+
+        fixture = self._fixture()
+        item = fixture["cases"][0]
+        case = EvaluationCase(item["case_id"], item["relevant_document_ids"])
+        service = RAGService(
+            TokenOverlapRetriever(fixture["documents"]),
+            UnsupportedFixtureGenerator(),
+            answer_verifier=ExactContextVerifier(),
+            verification_policy=AnswerVerificationPolicy("enforce"),
+            default_top_k=3,
+        )
+
+        response = service.ask(item["question"], top_k=3)
+        observation = EvaluationObservation(
+            case.case_id,
+            tuple(result.chunk.document_id for result in response.results),
+            response.abstained,
+            answer_supported=response.verification.supported,
+            abstention_reason=response.abstention_reason,
+        )
+        report = evaluate_observations((case,), (observation,), top_k=3)
+
+        self.assertTrue(response.abstained)
+        self.assertEqual(response.abstention_reason, "unsupported_answer")
+        self.assertTrue(observation.answer_generated)
+        self.assertEqual(observation.verification_status, "checked")
+        self.assertEqual(report.answered_count, 0)
+        self.assertEqual(report.generated_answer_count, 1)
+        self.assertEqual(report.checked_answer_count, 1)
+        self.assertEqual(report.post_generation_abstention_count, 1)
+        self.assertEqual(report.unsupported_answer_rate, 1.0)
+
+    def test_verification_error_is_distinct_from_evidence_abstention(self):
+        """Deterministic integration: one verifier failure and one no-evidence case are the minimum pair proving post-generation errors do not become checks or pre-generation abstentions."""
+
+        fixture = self._fixture()
+        answerable_item = fixture["cases"][0]
+        unanswerable_item = fixture["cases"][5]
+        cases = (
+            EvaluationCase(
+                answerable_item["case_id"],
+                answerable_item["relevant_document_ids"],
+            ),
+            EvaluationCase(
+                unanswerable_item["case_id"],
+                unanswerable_item["relevant_document_ids"],
+            ),
+        )
+        service = RAGService(
+            TokenOverlapRetriever(fixture["documents"]),
+            ExtractiveFixtureGenerator(),
+            answer_verifier=FailingVerifier(),
+            verification_policy=AnswerVerificationPolicy("report", "abstain"),
+            default_top_k=3,
+        )
+
+        responses = (
+            service.ask(answerable_item["question"], top_k=3),
+            service.ask(unanswerable_item["question"], top_k=3),
+        )
+        observations = tuple(
+            EvaluationObservation(
+                case.case_id,
+                tuple(result.chunk.document_id for result in response.results),
+                response.abstained,
+                answer_supported=None,
+                abstention_reason=response.abstention_reason,
+            )
+            for case, response in zip(cases, responses)
+        )
+        report = evaluate_observations(cases, observations, top_k=3)
+
+        self.assertEqual(
+            tuple(response.abstention_reason for response in responses),
+            ("verification_error", "no_relevant_evidence"),
+        )
+        self.assertEqual(
+            tuple(observation.answer_generated for observation in observations),
+            (True, False),
+        )
+        self.assertEqual(
+            tuple(observation.verification_status for observation in observations),
+            ("error", "not_checked"),
+        )
+        self.assertEqual(report.generated_answer_count, 1)
+        self.assertEqual(report.checked_answer_count, 0)
+        self.assertEqual(report.verification_error_count, 1)
+        self.assertEqual(report.pre_generation_abstention_count, 1)
+        self.assertEqual(report.post_generation_abstention_count, 1)
+
+    def test_answer_state_denominators_cover_returned_suppressed_and_failed_paths(self):
+        """Deterministic contract: five cases isolate unchecked, checked, enforced, verifier-error, and evidence-gated paths so every answer-state denominator has a non-vacuous expected value."""
+
+        cases = (
+            EvaluationCase("unchecked", ("d1",)),
+            EvaluationCase("checked", ("d2",)),
+            EvaluationCase("enforced", ("d3",)),
+            EvaluationCase("verification-error", ("d4",)),
+            EvaluationCase("no-evidence", ()),
+        )
+        observations = (
+            EvaluationObservation("unchecked", ("d1",), False),
+            EvaluationObservation("checked", ("d2",), False, True),
+            EvaluationObservation(
+                "enforced",
+                ("d3",),
+                True,
+                False,
+                abstention_reason="unsupported_answer",
+            ),
+            EvaluationObservation(
+                "verification-error",
+                ("d4",),
+                True,
+                abstention_reason="verification_error",
+            ),
+            EvaluationObservation(
+                "no-evidence",
+                (),
+                True,
+                abstention_reason="no_relevant_evidence",
+            ),
+        )
+
+        report = evaluate_observations(cases, observations, top_k=1)
+
+        self.assertEqual(report.answered_count, 2)
+        self.assertEqual(report.generated_answer_count, 4)
+        self.assertEqual(report.checked_answer_count, 2)
+        self.assertEqual(report.unsupported_answer_rate, 0.5)
+        self.assertEqual(report.pre_generation_abstention_count, 1)
+        self.assertEqual(report.post_generation_abstention_count, 2)
+        self.assertEqual(report.verification_error_count, 1)
 
     def test_unsupported_generation_is_measured_end_to_end(self):
         """A retrieved answer can be relevant while its generated text is unsupported."""
@@ -491,10 +725,22 @@ class EvaluationHarnessTests(unittest.TestCase):
             evaluate_observations((), (), top_k=1)
         with self.assertRaisesRegex(ValueError, "duplicates"):
             EvaluationObservation("case", ("doc", "doc"), False, True)
-        with self.assertRaisesRegex(ValueError, "requires"):
-            EvaluationObservation("case", ("doc",), False, None)
-        with self.assertRaisesRegex(ValueError, "cannot label"):
+        unchecked = EvaluationObservation("case", ("doc",), False, None)
+        self.assertEqual(unchecked.verification_status, "not_checked")
+        with self.assertRaisesRegex(ValueError, "generated"):
             EvaluationObservation("case", (), True, True)
+        with self.assertRaisesRegex(ValueError, "abstention reason"):
+            EvaluationObservation(
+                "case", ("doc",), False, True, "unsupported_answer"
+            )
+        with self.assertRaisesRegex(ValueError, "verification error"):
+            EvaluationObservation(
+                "case",
+                ("doc",),
+                True,
+                abstention_reason="verification_error",
+                answer_generated=False,
+            )
 
 
 if __name__ == "__main__":
