@@ -314,11 +314,53 @@ writers that bypass the configured transaction mechanism.
 | `test_capped_discovery_loads_gitignore_before_classifying_entries` | A late `.gitignore` entry in filesystem iteration order cannot expose an ignored file at the traversal cap | Forced order `.git`, `ignored.txt`, `.gitignore` and `max_discovered_entries=2` reproduce the ordering hazard; the report must stay incomplete, record `ignored.txt` as gitignored, and publish zero vectors. |
 | `test_symlink_special_and_unreadable_entries_have_bounded_diagnostics` | Symlinks, special files, and unreadable directories are counted safely without relying on host permissions | One symlink, FIFO, and injected `PermissionError` produce at least three skips; `max_issues=2` forces a `diagnostics_truncated` marker and the test skips only when symlink/FIFO creation is unavailable. |
 
+## Stable filters and content-risk policy
+
+| Test | What it protects | Parameter rationale | Class |
+| --- | --- | --- | --- |
+| `test_service_snapshots_filters_once_before_calling_the_retriever` | One immutable authorization view reaches a custom retriever | A mapping that exposes one valid view and then empties makes repeated reads observable; one tenant key isolates snapshot behavior | Deterministic contract |
+| `test_filters_reject_custom_comparison_objects_before_retrieval` | Arbitrary equality code cannot enter filtering | `object()` is the smallest unsupported custom value, and zero retriever calls proves rejection precedes retrieval | Security regression |
+| `test_vector_store_snapshots_drifting_filters_and_reserved_ids` | Direct vector callers retain tenant, document, chunk, and nested-value scope | Two allowed chunks plus one denied document distinguish every exact-match filter while `top_k=10` prevents truncation from hiding leakage | Security regression |
+| `test_qasc_snapshots_drifting_filters_and_document_id` | QASC applies one tenant/document scope to every document | Two one-sentence documents and radius `0` isolate filtering from window expansion | Security regression |
+| `test_default_policy_quarantines_only_explicit_prompt_injection_marks` | The default gate removes explicitly marked evidence but keeps ordinary untrusted evidence | One marked and one unmarked candidate are the minimum set proving selective quarantine and preserved generation | Behavioral integration |
+| `test_all_quarantined_evidence_abstains_before_other_components` | Risk-only evidence stops before relevance, generation, and verification | One marked result plus event-recording collaborators proves the distinct `content_risk` path without score effects | Behavioral integration |
+| `test_allow_all_policy_preserves_deliberate_legacy_behavior` | Applications can explicitly retain pre-gate behavior | One marked candidate and the allow-all policy isolate the compatibility choice | Compatibility contract |
+| `test_content_risk_policy_cannot_invent_duplicate_or_spoof_evidence` | Replaceable policies cannot expand or rewrite canonical evidence | One canonical result is challenged by one invented result, one duplicate pair, and one provenance mutation | Adversarial contract |
+| `test_factory_exposes_the_selected_content_risk_policy` | The composition root preserves explicit policy injection | One falsey-independent policy instance makes identity, rather than equivalent behavior, observable | Factory integration |
+
+## Evaluation state and fixture provenance
+
+| Test | What it protects | Parameter rationale | Class |
+| --- | --- | --- | --- |
+| `test_fixture_declares_version_identity_and_judgment_provenance` | Deterministic datasets remain traceable without implying production quality | One schema version, semantic dataset version, document judgment unit, and three provenance fields are the minimum explicit contract | Dataset contract |
+| `test_fixture_declared_categories_are_complete_and_consistent` | English, Hebrew, prose, code, answerable, and unanswerable coverage cannot disappear silently | Seven existing cases cover both language and answerability axes while one code case isolates content type | Dataset contract |
+| `test_unchecked_returned_answer_has_distinct_answered_and_checked_counts` | Verification-disabled answers count as returned/generated but not checked | One answerable case with `top_k=3` is the smallest denominator split | Deterministic integration |
+| `test_enforced_unsupported_generation_retains_its_verifier_outcome` | Enforcement does not erase a negative verdict | One unsupported generation yields one checked generation, zero returned answers, and one post-generation abstention | Deterministic integration |
+| `test_verification_error_is_distinct_from_evidence_abstention` | Verifier failure is not credited as an ordinary no-evidence abstention | One verifier-error case plus one no-evidence case is the minimum phase distinction | Deterministic integration |
+| `test_answer_state_denominators_cover_returned_suppressed_and_failed_paths` | Every answer-state denominator remains independently visible | Five cases isolate unchecked return, checked return, enforced rejection, verifier failure, and pre-generation abstention | Deterministic contract |
+| `test_reserved_abstention_reasons_fix_their_pipeline_phase` | Service-owned reasons cannot contradict their generation phase | One invalid state per reserved reason plus two custom-policy states separates fixed service semantics from explicit application phases | Adversarial contract |
+
+## Repository boundary and reconciliation regressions
+
+| Test | What it protects | Parameter rationale | Class |
+| --- | --- | --- | --- |
+| `test_policy_flags_require_exact_booleans` | Truthy impostors cannot enable excluded repository content | String, integer, and null-like values exercise coercion without entering discovery | Security contract |
+| `test_directory_identity_change_after_discovery_fails_closed` | One approved directory identity governs inventory and reads | An approved file and a replacement directory with the same filename make redirected content observable while zero publication proves fail-closed behavior | Security regression |
+| `test_root_descriptor_is_closed_after_identity_check` | Identity probes do not leak directory handles | One explicit identity check must produce exactly one close call | Resource regression |
+| `test_discovery_uses_the_approved_directory_during_transient_path_change` | Discovery is descriptor-bound rather than pathname-bound | One approved and one replacement filename distinguish the opened directory from a transient pathname change | Security regression |
+| `test_unavailable_descriptor_scanning_fails_closed` | Platforms without descriptor scanning never fall back to path traversal | One file plus injected `NotImplementedError` isolates capability failure and requires zero indexed records | Portability security regression |
+| `test_file_disappearance_is_bounded_and_marks_scan_incomplete` | Entry races remain per-file failures without a false complete report | One disappearing file is the minimum bounded failure and must publish no vectors | Race regression |
+| `test_root_path_indirection_after_discovery_fails_closed` | A changed root path cannot redirect reads after inventory | One matching relative filename under an alternate directory makes any redirected read visible | Security regression |
+| `test_stale_deletion_stops_at_the_error_budget` | Reconciliation respects `max_errors` | Three stale files with `max_errors=1` prove one failed attempt stops later deletions and marks the report incomplete | Reconciliation regression |
+| `test_malformed_secret_scan_fields_fail_before_publication` | Invalid scanner diagnostics cannot commit vectors or manifest state | Wrong text type, boolean/negative counts, mutable/blank/oversized categories cover each declared field boundary | Security contract |
+| `test_expanding_scanner_output_is_bounded_before_publication` | Transformed text cannot bypass raw-file limits | A one-byte input expanded to 17 bytes against a 16-byte cap isolates post-scan enforcement | Resource contract |
+
 ## Local evidence
 
-On the prepared stabilization branch, this command runs 256 tests: 254 pass and two optional
-integration tests skip because the Tree-sitter and spaCy extras are not
-installed.
+The historical `c91ee87` baseline ran 256 tests: 254 passed and two optional
+integration tests skipped because the Tree-sitter and spaCy extras were not
+installed. Later commits add the focused regressions above; use the command
+below to record the exact count for the checked-out revision.
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -v

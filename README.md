@@ -89,7 +89,11 @@ for citation in response.citations:
 
 Metadata filters are applied inside the vector store. Tenant or access-control
 filters should always be supplied by trusted application code, never copied
-directly from model output.
+directly from model output. The service snapshots a filter mapping once before
+retrieval, and the built-in vector and QASC retrievers repeat that protection
+for direct callers. Keys must be built-in strings; values must use immutable
+built-in scalars or recursively supported containers. Matching remains exact,
+including the reserved `document_id` and `chunk_id` filters.
 
 ## Use production embeddings
 
@@ -267,9 +271,10 @@ response = app.ask(
 ```
 
 `repository_id` is a stable application identity, not a path. Reuse it when
-refreshing the same repository. A complete refresh deletes indexed files that
-no longer exist; if discovery stops at a resource limit, previously indexed
-files that were not observed are preserved.
+refreshing the same repository. A complete, successful refresh deletes indexed
+files that no longer exist. A resource limit, processing failure, or stale
+deletion failure marks the refresh incomplete and preserves entries that were
+not safely reconciled. Reconciliation also stops at `max_errors`.
 
 Successful manifest entries also record a deterministic index fingerprint and
 the file's indexed chunk count. On a later scan, an identical raw file is
@@ -331,8 +336,10 @@ complete one.
 Secret detection is defense in depth, not a guarantee. Only index repositories
 you are authorized to read, keep retrieval filters in trusted application
 code, and never place secrets in source control. Repository content always has
-`content_trust="untrusted_repository"`; a prompt-injection flag is a warning
-for downstream policy and does not make the text trusted.
+`content_trust="untrusted_repository"`. The default query policy quarantines
+evidence only when `prompt_injection_suspected` is exactly `True`; the metadata
+mark is neither authentication nor authorization, and unmarked repository text
+must still be treated as untrusted.
 
 The dependency-free baseline uses Python's AST and conservative declaration
 patterns, then falls back to bounded line windows. For richer multi-language
@@ -617,19 +624,49 @@ Verifier exceptions either propagate with `on_error="raise"` or fail closed
 with `on_error="abstain"`. Both choices are explicit; verifier failure is never
 silently treated as support.
 
+### Quarantine marked retrieved content
+
+`RAGService` applies a provider-neutral content-risk policy after retrieval has
+been snapshotted and before relevance selection, reranking, generation, or
+verification. The default `PromptInjectionContentRiskPolicy` removes only
+evidence explicitly marked with `prompt_injection_suspected=True`. If every
+candidate is removed, the service returns a structured abstention with reason
+`content_risk` and does not call downstream model components. Ordinary
+`content_trust="untrusted_repository"` evidence is not removed solely because
+it came from a repository.
+
+Applications that deliberately preserve the earlier behavior must opt in
+explicitly:
+
+```python
+from modular_rag import AllowAllContentRiskPolicy, build_demo_rag
+
+app = build_demo_rag(
+    content_risk_policy=AllowAllContentRiskPolicy(),
+)
+```
+
+A custom `ContentRiskPolicy` may filter or reorder canonical candidates, but it
+cannot invent, duplicate, rescore, or rewrite their provenance. Content-risk
+policy does not replace tenant or repository authorization filters.
+
 ### Measure retrieval and abstention
 
 `evaluate_observations(...)` calculates recall@k, mean reciprocal rank, nDCG,
 abstention precision/recall, and unsupported-answer rate from fixed cases. It
-rejects duplicate ranked IDs and incomplete or contradictory answer labels;
-the report exposes answered and verifier-checked denominators so a zero safety
-rate cannot look meaningful when no answer was evaluated. The required smoke
-corpus in `tests/fixtures/rag_evaluation.json` covers English, Hebrew, prose,
-code, and unanswerable questions with a deterministic local retriever and an
-independent exact-context verifier. It validates the evaluation and
-orchestration path, not the quality of a production embedding model. Real E5
-and cross-encoder measurements should remain an explicit optional suite and
-must report which weights were actually available.
+rejects duplicate ranked IDs and contradictory answer states. The report keeps
+returned answers, generated answers, verifier-checked answers, verification
+errors, and pre/post-generation abstentions separate, so an unchecked answer
+or an enforced rejection cannot disappear into a misleading denominator.
+
+The versioned deterministic fixture in `tests/fixtures/rag_evaluation.json`
+declares dataset identity, judgment provenance, document-level judgment units,
+language, content category, and answerability. It covers English, Hebrew,
+prose, code, and unanswerable questions with a deterministic local retriever
+and independent exact-context verifier. It validates contracts and
+orchestration, not production model quality. Real E5 and cross-encoder
+measurements remain an optional suite and must report the exact available
+weights and fixture version.
 
 ## Packages
 
@@ -645,6 +682,8 @@ src/
     ├── transactions.py    Shared in-process index transaction coordinator
     ├── fingerprint.py     Deterministic index identities for safe incremental reuse
     ├── evaluation.py      Retrieval and answer-safety metrics
+    ├── content_risk.py    Provider-neutral pre-model quarantine policies
+    ├── filters.py         Immutable exact-match filter snapshots
     ├── embedding.py       Demo hashing and optional local dense embeddings
     ├── chunking.py        Default overlapping word chunker
     ├── code.py            Non-executing syntax-aware repository chunking
@@ -655,7 +694,7 @@ src/
     ├── relevance.py       Pre-generation evidence selection policies
     ├── verification.py    Post-generation verification policy
     ├── generation.py      Offline demo generator
-    ├── service.py         Retrieve -> relevance gate -> rerank -> answer -> cite
+    ├── service.py         Retrieve -> risk/relevance gates -> rerank -> answer -> cite
     ├── factory.py         Dependency-free composition root
     └── adapters/
         ├── memory.py      In-memory vector store
@@ -815,11 +854,14 @@ class CustomSentenceSegmenter:
 - Scores come from the latest ranking stage (the retriever or, when enabled,
   the reranker). Do not treat scores from different backends as directly
   comparable.
-- The default filters use exact metadata equality. A production store must
-  implement equivalent filtering before results are returned.
+- The default filters use exact equality over immutable built-in values. The
+  mapping is snapshotted once before retrieval; a production store must apply
+  equivalent authorization filtering before results are returned.
 - Treat all repository text as untrusted input even after secret redaction.
-  Enforce tenant/repository filters outside the model and inspect
-  `prompt_injection_suspected` according to application policy.
+  Enforce tenant/repository filters outside the model. The default service
+  quarantines explicit `prompt_injection_suspected=True` evidence before model
+  exposure; use `AllowAllContentRiskPolicy` only as an explicit compatibility
+  choice.
 - Persist the repository manifest alongside a production vector store so
   refreshes can remove deleted files without confusing transient failures with
   intentional deletion. Keep the manifest and its vector/index namespace as one
@@ -840,9 +882,11 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 See [`tests/README.md`](tests/README.md) for the behavioral and parameter
 rationale behind the refined contract tests.
 
-At commit `d508311`, the local suite runs 256 tests: 254 pass, while two
-optional integration tests skip when Tree-sitter or spaCy extras are not
-installed.
+The historical `c91ee87` baseline ran 256 tests: 254 passed, while two optional
+integration tests skipped when Tree-sitter or spaCy extras were not installed.
+Later stabilization commits add focused regressions, so run the command above
+and record the checked-out revision's actual count rather than reusing the
+baseline total.
 
 Every pull request and every push to `main` installs the package, runs the
 dependency-consistency and source-compilation gates, runs the tests, and
